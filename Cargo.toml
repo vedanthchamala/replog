@@ -1,0 +1,16 @@
+[package]
+name = "replog"
+version = "0.1.0"
+edition = "2024"
+description = "A Kafka-style replicated commit log, built from scratch"
+license = "MIT"
+
+[dependencies]
+crc32fast = "1"
+thiserror = "2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
