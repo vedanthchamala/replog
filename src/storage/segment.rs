@@ -16,11 +16,11 @@ pub struct Segment {
     bytes_since_index: u64,
 }
 
-fn log_path(dir: &Path, base_offset: u64) -> PathBuf {
+pub(crate) fn log_path(dir: &Path, base_offset: u64) -> PathBuf {
     dir.join(format!("{base_offset:020}.log"))
 }
 
-fn index_path(dir: &Path, base_offset: u64) -> PathBuf {
+pub(crate) fn index_path(dir: &Path, base_offset: u64) -> PathBuf {
     dir.join(format!("{base_offset:020}.index"))
 }
 
@@ -213,6 +213,41 @@ impl Segment {
             }
         }
         Ok(out)
+    }
+
+    /// Byte position where `offset` starts in this segment's file (`size` for
+    /// the position just past the last record).
+    pub fn position_of(&self, offset: u64, config: &LogConfig) -> Result<u64> {
+        if offset < self.base_offset || offset > self.next_offset {
+            return Err(StorageError::OffsetOutOfRange(offset));
+        }
+        if offset == self.next_offset {
+            return Ok(self.size);
+        }
+        let rel = (offset - self.base_offset) as u32;
+        let start_pos = self.index.lookup(rel).map(|(_, pos)| pos as u64).unwrap_or(0);
+        let mut file = File::open(&self.log_path)?;
+        file.seek(SeekFrom::Start(start_pos))?;
+        let mut buf = Vec::new();
+        file.take(self.size - start_pos).read_to_end(&mut buf)?;
+        let mut pos = 0usize;
+        loop {
+            match Record::decode(&buf[pos..], config.max_record_bytes) {
+                DecodeOutcome::Record { record, consumed } => {
+                    if record.offset == offset {
+                        return Ok(start_pos + pos as u64);
+                    }
+                    pos += consumed;
+                }
+                _ => {
+                    return Err(StorageError::Corrupt {
+                        offset,
+                        position: start_pos + pos as u64,
+                        reason: "offset not found while locating position".into(),
+                    });
+                }
+            }
+        }
     }
 
     pub fn base_offset(&self) -> u64 {

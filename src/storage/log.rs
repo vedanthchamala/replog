@@ -95,13 +95,31 @@ impl Log {
     }
 
     pub fn append(&mut self, key: Option<Vec<u8>>, value: Vec<u8>) -> Result<AppendInfo> {
-        let offset = self.active.next_offset();
         let record = Record {
-            offset,
+            offset: self.active.next_offset(),
             timestamp_ms: Record::now_ms(),
             key,
             value,
         };
+        self.append_record(record)
+    }
+
+    /// Appends a record fetched from a leader, preserving its offset and
+    /// timestamp. The offset must continue this log exactly — replication is
+    /// not allowed to create gaps or rewrites.
+    pub fn append_replicated(&mut self, record: Record) -> Result<AppendInfo> {
+        if record.offset != self.next_offset() {
+            return Err(StorageError::InvalidLayout(format!(
+                "replicated append at offset {} but log ends at {}",
+                record.offset,
+                self.next_offset()
+            )));
+        }
+        self.append_record(record)
+    }
+
+    fn append_record(&mut self, record: Record) -> Result<AppendInfo> {
+        let offset = record.offset;
         let encoded_len = record.encoded_len() as u64;
         if encoded_len > self.config.max_record_bytes as u64 {
             return Err(StorageError::RecordTooLarge(encoded_len));
@@ -192,5 +210,77 @@ impl Log {
 
     pub fn segment_count(&self) -> usize {
         self.closed.len() + 1
+    }
+
+    /// Truncates the log so that `new_next` becomes the next offset (records
+    /// at `new_next` and beyond are removed). Tail-only by construction: this
+    /// exists for a follower reconciling its divergent suffix with a new
+    /// leader, never for editing history.
+    pub fn truncate_suffix(&mut self, new_next: u64) -> Result<()> {
+        use crate::storage::segment::{index_path, log_path};
+
+        if new_next >= self.next_offset() {
+            return Ok(());
+        }
+        if new_next < self.start_offset() {
+            return Err(StorageError::OffsetOutOfRange(new_next));
+        }
+
+        // The segment that keeps the tail: the one covering new_next - 1, or
+        // the very first segment when the whole log is being emptied.
+        let target_base = if new_next == self.start_offset() {
+            self.start_offset()
+        } else if self.active.base_offset() < new_next {
+            self.active.base_offset()
+        } else {
+            *self
+                .closed
+                .range(..new_next)
+                .next_back()
+                .map(|(base, _)| base)
+                .expect("a segment must cover offsets before new_next")
+        };
+
+        let doomed: Vec<u64> = self
+            .closed
+            .range((
+                std::ops::Bound::Excluded(target_base),
+                std::ops::Bound::Unbounded,
+            ))
+            .map(|(base, _)| *base)
+            .collect();
+        for base in doomed {
+            self.closed.remove(&base);
+            fs::remove_file(log_path(&self.dir, base))?;
+            fs::remove_file(index_path(&self.dir, base))?;
+        }
+        let target_is_active = self.active.base_offset() == target_base;
+        if !target_is_active {
+            fs::remove_file(log_path(&self.dir, self.active.base_offset()))?;
+            fs::remove_file(index_path(&self.dir, self.active.base_offset()))?;
+        }
+
+        let position = if target_is_active {
+            self.active.position_of(new_next, &self.config)?
+        } else {
+            self.closed
+                .get(&target_base)
+                .expect("target segment present")
+                .position_of(new_next, &self.config)?
+        };
+        let target_log = log_path(&self.dir, target_base);
+        let file = fs::OpenOptions::new().write(true).open(&target_log)?;
+        file.set_len(position)?;
+        crate::storage::fsync_file(&file)?;
+
+        let rebuilt = Segment::recover(&self.dir, target_base, &self.config, true)?;
+        self.closed.remove(&target_base);
+        self.active = rebuilt;
+
+        self.durable_offset = match (self.durable_offset, new_next.checked_sub(1)) {
+            (Some(durable), Some(last)) => Some(durable.min(last)),
+            _ => None,
+        };
+        Ok(())
     }
 }

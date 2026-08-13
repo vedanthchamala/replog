@@ -1,8 +1,10 @@
+mod epoch;
 mod index;
 mod log;
 mod record;
 mod segment;
 
+pub use epoch::EpochCheckpoint;
 pub use log::{AppendInfo, Log};
 pub use record::{DecodeOutcome, Record};
 
