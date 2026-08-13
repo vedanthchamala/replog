@@ -107,7 +107,19 @@ pub fn spawn(
     dir: &Path,
     config: LogConfig,
 ) -> crate::storage::Result<(PartitionHandle, std::thread::JoinHandle<()>)> {
-    let log = Log::open(dir, config.clone())?;
+    // Time-based flushing has exactly one owner: this thread's recv timeout.
+    // Left enabled inside the Log too, its trigger fires on the first append
+    // after a quiet gap — flushing one record, then the timer flushing again
+    // ~max_ms later: two fsyncs per group where one suffices (measured: it
+    // doubled durable-ack p50). The Log keeps only the byte trigger.
+    let mut log_config = config.clone();
+    if let FsyncPolicy::Batch { max_bytes, .. } = log_config.fsync {
+        log_config.fsync = FsyncPolicy::Batch {
+            max_bytes,
+            max_ms: u64::MAX,
+        };
+    }
+    let log = Log::open(dir, log_config)?;
     let (tx, rx) = mpsc::channel();
     let (watch_tx, watch_rx) = watch::channel(log.next_offset());
     let name = dir.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
