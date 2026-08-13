@@ -219,7 +219,7 @@ Error codes (u16): 0 ok, 1 unknown topic/partition, 2 offset out of range,
 Headline: what client-side batching buys over TCP, and what the durable-ack
 contract costs vs written-ack.
 
-## Stage 3 (ACTIVE) — partitions + consumer groups
+## Stage 3 (DONE 2026-08-13) — partitions + consumer groups
 
 The stage's point: load sharing with a correctness contract. N consumers split a
 topic's partitions; membership changes (join, leave, crash) trigger rebalance; a
@@ -307,16 +307,113 @@ batch=100, inflight=8, round-robin) at acks=written and acks=durable — validat
 "partitions are the scaling knob" from Stage 2 with numbers, and shows where one
 broker saturates.
 
-## Stage 4 (skeleton) — replication + failover
+## Stage 4 (ACTIVE) — replication + failover
 
-- Controller (single, static for now) holds cluster metadata; brokers heartbeat it.
-- Followers replicate via the fetch path; leader tracks ISR by follower lag/liveness;
-  high-water mark = min(ISR match offsets); consumers read only up to HWM.
-- acks=0/1/all semantics at the produce path; `min.insync.replicas` equivalent.
-- Leader epochs: every leadership change bumps the epoch; fetches carry epoch; a
-  rejoining stale leader truncates its divergent suffix via epoch/offset check.
-- Failover demo: 3 brokers, kill -9 the leader under load, measure detection→election→
-  first-ack gap, checker verifies zero acked-loss.
+The centerpiece. A partition becomes a *replicated* log: one leader, N-1
+followers, an ISR the leader maintains, a high-water mark consumers cannot read
+past, and leader epochs so a stale leader's divergent history gets truncated
+instead of splitting the log. Pass condition (SPEC): `kill -9` the leader
+mid-stream at acks=all → new leader elected, **zero acked records lost**,
+checker-verified; stale-leader rejoin truncates via epoch check.
+
+### Cluster model
+
+- N broker *processes* + 1 controller *process* (`replog_controller` bin).
+  Single static controller = the documented SPOF simplification; the failover
+  demo kills brokers, never the controller (Stage 5 may revisit).
+- Controller state: brokers (id → addr, liveness), topics (partition →
+  replicas, leader, leader_epoch, ISR), a monotonically increasing metadata
+  version. Persisted as an atomically-renamed snapshot file on every change;
+  fsynced. Controller restart reloads it.
+- Brokers register at startup and heartbeat (500 ms); missing 3 s of
+  heartbeats = dead → controller re-elects leaders for every partition the
+  dead broker led: new leader = first *alive ISR* member; leader_epoch += 1;
+  ISR shrinks to alive members. Empty alive-ISR → partition offline (no
+  unclean election; honesty over availability).
+- Brokers pull cluster metadata from the controller when heartbeat responses
+  carry a newer version; clients pull it from any broker (Metadata response
+  gains leader info). CreateTopic gains replication_factor and is forwarded
+  broker → controller.
+
+### Data path
+
+- **Follower replica fetcher:** per hosted follower partition, a broker task
+  fetches from the leader via ReplicaFetch (like consumer fetch but: reads past
+  HWM, carries follower_id + the follower's current leader_epoch, and returns
+  the leader's log-end + HWM). Fetched records are appended verbatim (offsets
+  preserved — a new storage `append_replicated` path that validates
+  continuity).
+- **ISR + HWM at the leader:** the leader tracks each follower's fetch offset
+  (match offset). HWM = min(match offset of ISR members, leader LEO). A
+  follower whose fetch position is caught-up-enough (lag < threshold records
+  AND fetched within lag_time_ms) stays in ISR; falling behind → leader asks
+  the controller to shrink ISR (AlterIsr, epoch-checked); catching back up →
+  expand. Consumers fetch only up to HWM; fetch responses now carry the HWM.
+- **acks=all:** the produce ack is parked until HWM ≥ the batch's last offset.
+  Rejected with NotEnoughReplicas if |ISR| < min_insync_replicas (config,
+  default 2). acks levels become 0/1(leader-written)/2(leader-durable)/
+  3(all=ISR-replicated). Note the Kafka lesson made concrete: at acks=all,
+  durability comes from *replication*, not fsync — followers ack on write, not
+  flush.
+- **Leader epochs + truncation (KIP-101-lite):** each partition keeps an
+  epoch checkpoint file — (epoch, start_offset) pairs, appended when a broker
+  becomes leader for a new epoch. On becoming follower, a replica sends its
+  last (epoch, end_offset) to the leader (EpochCheck); the leader answers with
+  the end of that epoch in *its* history; the follower truncates its log to
+  min(own end, leader's answer) before fetching. Produce and ReplicaFetch
+  carry the expected epoch; mismatch → FencedEpoch, refresh metadata.
+- Storage additions: `Log::truncate_suffix(offset)` (tail-only, may drop whole
+  segments; active index rebuilt), `Log::append_replicated(record)` preserving
+  offsets, epoch checkpoint file next to the segments.
+
+### Protocol additions
+
+ReplicaFetch (10), EpochCheck (11) between brokers; RegisterBroker (12),
+BrokerHeartbeat (13), AlterIsr (14), ControllerMetadata (15) to the
+controller; Metadata response now carries per-partition (leader, epoch, ISR,
+replicas) + broker addresses; Fetch response carries HWM; Produce carries the
+client's believed leader_epoch (0 = don't care). New errors: NotLeader (8),
+FencedEpoch (9), NotEnoughReplicas (10), Offline (11).
+
+### Client
+
+`ClusterClient`: bootstrap from any broker, cache metadata, route produce/fetch
+to partition leaders, and on NotLeader/FencedEpoch/connection-failure refresh
+metadata (with backoff) and retry — retries are what makes failover *invisible*
+to the workload and duplicates possible (at-least-once, counted by the
+checker).
+
+### Tests / evals (pass conditions in executable form)
+
+1. Storage: truncate_suffix property test (cut at arbitrary offsets, reopen
+   clean); epoch checkpoint round-trip; append_replicated continuity.
+2. 3 in-process brokers + controller: topic RF=3 → replicas spread, leader per
+   controller; produce acks=all → all three logs converge byte-identical; HWM
+   advances; consumer cannot read past HWM (kill a follower → HWM stalls →
+   consumer stalls → ISR shrinks → HWM resumes).
+3. Fencing: produce with stale epoch → FencedEpoch. ISR < min_isr →
+   NotEnoughReplicas at acks=all (kill both followers).
+4. **Failover eval (the SPEC pass condition):** 3 broker processes, workload at
+   acks=all with client history via ClusterClient, `kill -9` the leader
+   mid-stream → controller elects a new leader → producer retries through →
+   checker: zero acked ids lost, duplicates counted. Measured: kill→first
+   new ack gap.
+5. **Stale-leader rejoin:** partition the old leader away (kill -9), let the
+   cluster move on (new epoch, new writes), restart the old leader → it
+   becomes follower, EpochCheck truncates its divergent suffix, logs converge
+   byte-identical. Divergence is *manufactured* (acks=1 writes that only the
+   old leader had).
+6. Bench: produce throughput/latency at acks=0/1/all on a 3-broker localhost
+   cluster (replication overhead curve); failover time distribution over
+   several kills.
+
+### Explicit simplifications (say them before an interviewer does)
+
+Single static controller (SPOF); controller heartbeats over its own TCP
+connection rather than a gossip/quorum; no controlled shutdown handoff; no
+reassignment/rebalancing of replicas; HWM checkpointing is in-memory per
+leader epoch (a restarted leader re-derives it from follower fetches, and
+consumers may re-read — at-least-once holds).
 
 ## Stage 5 (skeleton) — torture harness
 
