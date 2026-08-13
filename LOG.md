@@ -188,3 +188,63 @@ delivered ≥ once, verified by checker ✅. Stage 3 closed.
 
 **Next:** Stage 4 planning (replication: controller, follower fetch, ISR,
 acks=all, leader epochs, failover) — the project's centerpiece.
+
+---
+
+## 2026-08-13 (later) — Stage 4 core lands: replication evals green after a three-bug hunt
+
+**Where the last session left off:** Stage 4's build was committed (storage
+primitives, cluster protocol, controller, broker cluster mode) but the working
+tree held the unfinished half: `ClusterClient` and the four replication evals —
+and the evals didn't pass. Two hung *forever*, two failed. A leftover test
+process from the interrupted session was still running, mid-hang; sampling it
+(`/usr/bin/sample`, thread stacks) was the starting evidence.
+
+**Bug 1 — the parked waiter (the hangs).** Client `Connection`'s read task, on
+socket EOF, failed all in-flight calls and exited — but a call started *after*
+that leaves a correlation-id waiter nothing will ever complete (the write into a
+FIN'd loopback socket succeeds silently). The replica fetcher hit it
+deterministically at leader shutdown: last long-poll completes, socket closes,
+next call parks forever → fetcher pins its `Arc<Replica>` → partition writer
+thread never sees channel disconnect → broker shutdown joins forever. Same hole
+on the client side could park the failover producer mid-attempt (its retry
+deadline was only checked between attempts). Fix: a `closed` flag on the pending
+map, set by the read task on exit *under the same lock* `call_start` inserts
+with — after connection death every new call fails fast with Closed. Static
+ownership analysis kept proving the hang impossible; per-await instrumentation
+found it in one run. Full writeup in interview/NOTES.md §3.
+
+**Bug 2 — the fetch that outlived its kill.** The stale-leader eval kills a
+follower whose fetcher had a long-poll in flight; the response (carrying one of
+the old leader's acks=written records) was appended by the "dead" fetcher before
+its next fencing check, so the restarted follower carried 101 records, recorded
+epoch 2 at 101, and the epoch protocol faithfully converged both logs around a
+record that was never committed history. Production shape of the same bug: a
+follower promoted to leader with a fetch in flight appends stale records into
+the new epoch's log. Fix: re-check the fetcher generation after *every* await,
+immediately before append/truncate. Fencing is per-await, not per-loop.
+
+**Bug 3 — ISR membership by past glory.** The keep rule `(in_isr && fresh) ||
+caught_up` let a dead-but-once-caught-up follower stay in the ISR forever (its
+frozen match offset equals a log end that nothing moves), so killing both
+followers never shrank the ISR and acks=all was still accepted. Fix: Kafka's
+lastCaughtUpTimeMs move — the leader timestamps each follower's last caught-up
+fetch, and one rule serves shrink and expand: in the ISR iff caught up within
+the lag window (never-fetched followers measured from leader takeover).
+
+Plus a test-harness bug for the collection: `Cluster::shutdown(self)` dropped
+the `TempDir`, deleting the data directories the test then "read back" as empty
+— the eval erased its own evidence. Shutdown now returns the tempdir.
+
+**Evals now green (the SPEC pass condition, in-process form):** kill the leader
+mid-stream at acks=all → new leader, **1200/1200 acked ids survive, zero lost**,
+first post-kill ack ~1.8 s (dominated by the 700 ms liveness timeout); replicas
+converge byte-identical; ISR shrinks on death and acks=all is *refused* below
+min-ISR; stale leader truncates its divergent suffix via epoch check and
+rejoins. `cargo test`: **35 tests green** across the workspace.
+
+**Next:** Stage 4 close-out per PLAN — the acks=0/1/all replication-overhead
+bench and failover-time distribution over repeated kills, then the
+process-boundary form of the failover eval (real `kill -9`, real processes;
+the in-process abort's two softenings are flagged in NOTES §7), then LOG/STATUS/
+NOTES/PDF milestone refresh.

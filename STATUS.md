@@ -3,7 +3,7 @@
 > Session pickup file. Read SPEC.md → PLAN.md → this file → LOG.md (latest entry) at
 > the start of every session, before touching code.
 
-**Stage:** 3 complete → 4 (replication + failover) next
+**Stage:** 4 core complete (evals green) → Stage 4 close-out (bench + process-boundary eval)
 **Last updated:** 2026-08-13
 
 ## Done
@@ -25,17 +25,26 @@
   counted, takeover 1.16 s. Fan-out findings: durable+pipelining ≈ written (590k);
   per-partition fsync fragments group commit (590k→211k at 8 partitions);
   single-machine ceiling ~600k rec/s is the machine. 28 tests green.
+- **Stage 4 CORE** — controller (liveness, ISR-only elections, fsynced snapshots),
+  replica fetchers with epoch reconciliation, ISR/HWM tracking, acks=all ledger,
+  `ClusterClient` (leader routing, retry-through-failover), four evals green:
+  failover at acks=all loses zero of 1200 acked ids (first post-kill ack ~1.8 s),
+  logs converge byte-identical, acks=all refused below min-ISR, stale leader
+  truncates via epoch check. Three bugs found and fixed on the way (LOG
+  2026-08-13: parked-waiter connection hang, per-await fencing, ISR
+  caught-up-recency rule). 35 tests green.
 
 ## In progress
 
-- (nothing — Stage 4 planning is next)
+- Stage 4 close-out: measurements + process-boundary eval remain (see next).
 
 ## Next actions (in order)
 
-1. PLAN.md: detail Stage 4 (controller, follower fetch, ISR tracking, HWM,
-   acks=all, min-ISR, leader epochs, failover demo + measurements).
-2. Build Stage 4 + evals (kill -9 leader under load at acks=all → zero acked
-   loss, checker-verified; stale-leader rejoin truncates via epoch).
+1. Stage 4 bench per PLAN: produce throughput/latency at acks=0/1/all on the
+   3-broker localhost cluster (replication overhead curve) + failover-time
+   distribution over repeated kills (`bench/`, CSV + plot).
+2. Process-boundary failover eval: broker as child processes, real `kill -9`
+   (the current eval is the in-process form; softenings flagged in NOTES §7).
 3. Stage 4 milestone: LOG + STATUS + NOTES + PDF refresh + push.
 4. Stage 5: torture harness (seeded fault schedules, offline checker).
 

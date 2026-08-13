@@ -5,8 +5,10 @@
 //! number of requests can be in flight on one socket — the broker may answer
 //! them out of order (long-poll fetches) and each still lands with its caller.
 
+mod cluster;
 mod group;
 
+pub use cluster::ClusterClient;
 pub use group::GroupConsumer;
 
 use std::collections::HashMap;
@@ -38,9 +40,17 @@ pub enum ClientError {
 
 pub type Result<T> = std::result::Result<T, ClientError>;
 
+struct Pending {
+    map: HashMap<u32, oneshot::Sender<Response>>,
+    /// Set (under this mutex) when the read task exits. A call started after
+    /// that would park a waiter no response can ever complete — the flag and
+    /// the insert share one lock so no call can slip through the gap.
+    closed: bool,
+}
+
 struct Inner {
     tx: UnboundedSender<Vec<u8>>,
-    pending: Mutex<HashMap<u32, oneshot::Sender<Response>>>,
+    pending: Mutex<Pending>,
     next_corr: AtomicU32,
 }
 
@@ -57,7 +67,10 @@ impl Connection {
         let (tx, mut out_rx) = unbounded_channel::<Vec<u8>>();
         let inner = Arc::new(Inner {
             tx,
-            pending: Mutex::new(HashMap::new()),
+            pending: Mutex::new(Pending {
+                map: HashMap::new(),
+                closed: false,
+            }),
             next_corr: AtomicU32::new(1),
         });
 
@@ -77,7 +90,7 @@ impl Connection {
                     Ok(Some(frame)) => match proto::decode_response(&frame) {
                         Ok((corr, resp)) => {
                             let Some(inner) = weak.upgrade() else { break };
-                            if let Some(waiter) = inner.pending.lock().unwrap().remove(&corr) {
+                            if let Some(waiter) = inner.pending.lock().unwrap().map.remove(&corr) {
                                 let _ = waiter.send(resp);
                             }
                         }
@@ -90,9 +103,13 @@ impl Connection {
                 }
             }
             // Dropping the parked senders turns every in-flight call into
-            // ClientError::Closed.
+            // ClientError::Closed; the flag turns every FUTURE call into one
+            // too (a request written after this point has no reader left to
+            // ever complete it).
             if let Some(inner) = weak.upgrade() {
-                inner.pending.lock().unwrap().clear();
+                let mut pending = inner.pending.lock().unwrap();
+                pending.closed = true;
+                pending.map.clear();
             }
         });
 
@@ -104,9 +121,18 @@ impl Connection {
     pub fn call_start(&self, req: &Request) -> Result<oneshot::Receiver<Response>> {
         let corr = self.inner.next_corr.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
-        self.inner.pending.lock().unwrap().insert(corr, tx);
+        {
+            let mut pending = self.inner.pending.lock().unwrap();
+            if pending.closed {
+                return Err(ClientError::Closed);
+            }
+            pending.map.insert(corr, tx);
+        }
         let frame = proto::encode_request(req, corr);
-        self.inner.tx.send(frame).map_err(|_| ClientError::Closed)?;
+        if self.inner.tx.send(frame).is_err() {
+            self.inner.pending.lock().unwrap().map.remove(&corr);
+            return Err(ClientError::Closed);
+        }
         Ok(rx)
     }
 

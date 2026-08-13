@@ -32,7 +32,12 @@ pub struct ReplState {
     pub is_leader: bool,
     pub isr: Vec<u32>,
     pub replicas: Vec<u32>,
-    /// follower id -> (next offset it asked for, when it last fetched)
+    /// follower id -> (next offset it asked for, when it was last *caught
+    /// up* — i.e. fetched at or past the leader's log end). ISR membership
+    /// keys off the second field, Kafka's lastCaughtUpTimeMs move: "was
+    /// caught up recently", not "was caught up once" (a dead follower's
+    /// match offset stays maxed forever) and not "fetched recently" (a
+    /// perpetually lagging follower fetches constantly without catching up).
     pub match_offsets: HashMap<u32, (u64, Instant)>,
     /// acks=all produces waiting for the HWM: (last_offset, base, count, reply)
     pub pending_all: Vec<(u64, u64, u32, oneshot::Sender<Result<(u64, u32), ErrorCode>>)>,
@@ -175,6 +180,13 @@ async fn fetcher_loop(
             error: ErrorCode::None,
             end_offset,
         }) => {
+            // Re-check after the await: a role/epoch change (or an aborted
+            // broker in tests) while the reply was in flight means this
+            // fetcher no longer speaks for the replica — truncating now
+            // would mutate a log it doesn't own anymore.
+            if !is_current() {
+                return;
+            }
             let local_end = *replica.handle.next_offset.borrow();
             let target = end_offset.min(local_end);
             if target < local_end {
@@ -220,6 +232,13 @@ async fn fetcher_loop(
                 records,
                 ..
             }) => {
+                // Same re-check as reconciliation: the response was in
+                // flight while our claim on this replica may have lapsed;
+                // appending stale records into a new epoch's log is exactly
+                // the divergence this machinery exists to prevent.
+                if !is_current() {
+                    return;
+                }
                 if leader_epoch > local_epoch {
                     replica.handle.record_epoch(leader_epoch);
                     local_epoch = leader_epoch;

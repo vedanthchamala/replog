@@ -257,6 +257,21 @@ impl Broker {
 }
 
 impl BrokerHandle {
+    /// Crash simulation for in-process tests: tasks are aborted, nothing is
+    /// flushed or joined. The broker just stops answering, like a `kill -9`
+    /// minus the process boundary.
+    pub fn abort(self) {
+        self.accept_task.abort();
+        self.expiry_task.abort();
+        if let Some(task) = self.cluster_task {
+            task.abort();
+        }
+        invalidate_replicas(&self.shared);
+        self.shared.replicas.write().unwrap().clear();
+        *self.shared.controller_conn.write().unwrap() = None;
+        std::mem::forget(self.shared);
+    }
+
     /// Graceful stop: closes connections, then joins every partition thread
     /// (each does a final flush on the way out).
     pub async fn shutdown(self) {
@@ -266,6 +281,7 @@ impl BrokerHandle {
         if let Some(task) = self.cluster_task {
             let _ = task.await;
         }
+        invalidate_replicas(&self.shared);
         self.shared.replicas.write().unwrap().clear();
         *self.shared.controller_conn.write().unwrap() = None;
         let mut shared = self.shared;
@@ -293,6 +309,23 @@ impl BrokerHandle {
             }
         })
         .await;
+    }
+}
+
+/// Tells every fetcher to die (they hold partition handles; a partition
+/// thread cannot exit while its fetcher lives) and fails parked acks.
+fn invalidate_replicas(shared: &Arc<Shared>) {
+    for replica in shared.replicas.read().unwrap().values() {
+        let failed = {
+            let mut st = replica.state.lock().unwrap();
+            st.fetcher_generation += 1;
+            st.fetcher_alive = false;
+            st.is_leader = false;
+            std::mem::take(&mut st.pending_all)
+        };
+        for (_, _, _, reply) in failed {
+            let _ = reply.send(Err(ErrorCode::NotLeader));
+        }
     }
 }
 
@@ -641,7 +674,6 @@ async fn isr_maintenance(shared: &Arc<Shared>, conn: &Connection) {
     let lag = Duration::from_millis(shared.config.replica_lag_ms);
     let replicas: Vec<Arc<Replica>> = shared.replicas.read().unwrap().values().cloned().collect();
     for replica in replicas {
-        let log_end = *replica.handle.next_offset.borrow();
         let proposal = {
             let st = replica.state.lock().unwrap();
             if !st.is_leader {
@@ -650,15 +682,15 @@ async fn isr_maintenance(shared: &Arc<Shared>, conn: &Connection) {
             let now = Instant::now();
             let mut desired: Vec<u32> = vec![self_id];
             for follower in st.replicas.iter().filter(|id| **id != self_id) {
-                let (matched, last_fetch) = st
+                // One rule for shrink AND expand: in the ISR iff caught up
+                // within the lag window. A follower that never fetched gets
+                // the window measured from when this leader took over.
+                let (_, last_caught_up) = st
                     .match_offsets
                     .get(follower)
                     .copied()
                     .unwrap_or((0, st.leader_since));
-                let in_isr = st.isr.contains(follower);
-                let fresh = now.duration_since(last_fetch) <= lag;
-                let caught_up = matched >= log_end;
-                if (in_isr && fresh) || caught_up {
+                if now.duration_since(last_caught_up) <= lag {
                     desired.push(*follower);
                 }
             }
@@ -1102,6 +1134,7 @@ fn dispatch(shared: &Arc<Shared>, req: Request, corr: u32, out: &UnboundedSender
                 respond(out, &replica_error(ErrorCode::NotLeader), corr);
                 return;
             };
+            let log_end = *replica.handle.next_offset.borrow();
             let accepted = {
                 let mut st = replica.state.lock().unwrap();
                 if !st.is_leader {
@@ -1111,7 +1144,18 @@ fn dispatch(shared: &Arc<Shared>, req: Request, corr: u32, out: &UnboundedSender
                 } else {
                     // A fetch at `offset` proves the follower has everything
                     // before it — that is the replication progress signal.
-                    st.match_offsets.insert(follower_id, (offset, Instant::now()));
+                    // The caught-up clock only advances when the fetch
+                    // reaches the log end; a fetch that is merely *recent*
+                    // must not count as keeping up.
+                    let caught_up = if offset >= log_end {
+                        Instant::now()
+                    } else {
+                        st.match_offsets
+                            .get(&follower_id)
+                            .map(|&(_, t)| t)
+                            .unwrap_or(st.leader_since)
+                    };
+                    st.match_offsets.insert(follower_id, (offset, caught_up));
                     None
                 }
             };
