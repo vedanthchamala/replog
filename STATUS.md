@@ -3,7 +3,7 @@
 > Session pickup file. Read SPEC.md → PLAN.md → this file → LOG.md (latest entry) at
 > the start of every session, before touching code.
 
-**Stage:** 2 — TCP broker + clients (planning → building)
+**Stage:** 2 complete → 3 (partitions + consumer groups) next
 **Last updated:** 2026-08-13
 
 ## Done
@@ -15,21 +15,25 @@
   roll, torn-tail recovery, fsync policies with F_FULLFSYNC on macOS), 8/8 tests
   green, and the fsync-policy curve measured + plotted (`bench/results/`):
   always 238 appends/s vs batch 550k vs os 955k at 100 B values.
+- **Stage 2 COMPLETE** — wire protocol (frames, correlation IDs), tokio broker
+  (per-partition writer threads, durable acks held until covering flush, long-poll
+  fetch, `__offsets` log), pipelined clients. 18 tests green incl. `kill -9` of a
+  real broker process with zero durable-acked loss. Bench: batch curve 21.8k→553k
+  rec/s written / 91→56k durable; pipelining to ~646k; open-loop percentiles.
+  War story: the double-fsync (two timers, one flush) — LOG 2026-08-13.
 
 ## In progress
 
-- Stage 2: detail the plan in PLAN.md, then build wire protocol + tokio broker +
-  producer/consumer clients.
+- Interview PDF first compile (Stage 2 milestone).
 
 ## Next actions (in order)
 
-1. PLAN.md: Stage 2 detailed (frame format, message types, broker task model,
-   client API, tests, bench).
-2. Build `proto` module (frames + message encode/decode, round-trip tests).
-3. Build broker (per-partition writer task, ack-on-covering-flush) + clients.
-4. Stage 2 evals: e2e produce→fetch, offset resume after restart; bench
-   throughput vs batch size + latency percentiles.
-5. Stage 2 milestone: first pdflatex compile of interview/replog_guide.tex.
+1. interview/replog_guide.tex: compile NOTES.md material with pdflatex.
+2. PLAN.md: detail Stage 3 (key-hash partitioning, group coordinator,
+   join/leave/heartbeat, generation fencing, rebalance, checker v1).
+3. Build Stage 3 + its evals (2 consumers split partitions; kill one → rebalance;
+   at-least-once delivery verified by checker).
+4. Stage 3 milestone: LOG entry + STATUS + PDF refresh + push.
 
 ## Standing rules for any session (any model)
 

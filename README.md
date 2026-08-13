@@ -8,10 +8,10 @@ replication with ISR tracking and leader-epoch fencing — and a fault-injection
 harness whose checker proves the durability contract (`kill -9` the leader,
 zero acknowledged writes lost) from client-observed histories.
 
-**Status:** Stage 2 of 6 — TCP broker + clients. Stage 1 (single-node storage
-engine) is complete. See [SPEC.md](SPEC.md) for guarantees and the stage plan,
-[PLAN.md](PLAN.md) for the active stage in detail, [LOG.md](LOG.md) for the dated
-build log.
+**Status:** Stages 1–2 of 6 complete — storage engine + TCP broker/clients; next
+is Stage 3 (partitioning + consumer groups). See [SPEC.md](SPEC.md) for guarantees
+and the stage plan, [PLAN.md](PLAN.md) for the active stage in detail,
+[LOG.md](LOG.md) for the dated build log.
 
 Built as a study of why real distributed logs are designed the way they are: every
 major decision (fsync batching, sparse indexes, ISR vs quorum replication, epoch
@@ -31,10 +31,25 @@ reproduce with `bench/run_append_bench.sh`):
 One true media barrier costs ~4.2 ms on this SSD — fsync-per-append caps the engine
 at ~238 appends/s regardless of record size. Group commit amortizes one barrier over
 ~1 MiB of appends; the acks for those records are held until the covering flush.
-Details and the full CSV/plot: [`bench/results/`](bench/results/).
+
+The Stage 2 broker curve (one broker, one partition, localhost, 100 B values;
+`bench/run_broker_bench.sh`) — produce throughput vs client batch size:
+
+| records per batch | acks=written | acks=durable (held until covering flush) |
+|---|---|---|
+| 1 | 21.8k rec/s | 91 rec/s |
+| 100 | 526k rec/s | 8.2k rec/s |
+| 1000 | 553k rec/s | 56k rec/s |
+
+Same amortization story one layer up: client batching splits the per-request cost
+(and, at acks=durable, the group-commit barrier) across the batch. A `kill -9`
+integration test verifies that every durable-acked record survives crash + restart
+of a real broker process. Details, plots, CSVs: [`bench/results/`](bench/results/).
 
 ```
-cargo test                    # correctness suite
-bench/run_append_bench.sh     # fsync-policy matrix → CSV
-uv run bench/plot_append.py   # CSV → plot
+cargo test                      # correctness suite (18 tests)
+bench/run_append_bench.sh       # Stage 1: fsync-policy matrix → CSV
+bench/run_broker_bench.sh       # Stage 2: batch/acks/pipelining matrix → CSV
+uv run bench/plot_append.py     # CSVs → plots
+uv run bench/plot_broker.py
 ```

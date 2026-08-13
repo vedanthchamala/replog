@@ -100,3 +100,45 @@ loud error ✅ · fsync-policy bench plotted ✅. Stage 1 closed; 8/8 tests gree
 
 **Next:** Detail Stage 2 in PLAN.md (wire protocol + tokio broker), build it,
 first PDF compile at the milestone.
+
+---
+
+## 2026-08-13 (later) — Stage 2 COMPLETE: TCP broker + clients, measured
+
+**Built:** `proto` (length-prefixed LE frames, correlation IDs, round-trip +
+truncation/garbage rejection tests), `broker` (one writer *thread* per partition
+owning its Log; durable acks parked in a ledger until the covering flush; long-poll
+fetch via a per-partition `watch` of next_offset; `__offsets` internal log replayed
+at startup), `client` (correlation-routed pipelined connection, batching Producer,
+committing/resuming Consumer), `replog_broker` bin. 18 tests green (4 proto,
+6 broker, 8 storage).
+
+**The test that matters:** broker as a real child process, produce at acks=durable,
+`kill -9`, restart on the same data dir → all 50 acked records fetchable. The
+Stage 2 form of the SPEC durability contract, checked at the process boundary.
+
+**War story — the double-fsync (full writeup in interview/NOTES.md §3):** first
+bench run showed durable p50 ~2× expected, written throughput ~half of storage
+speed, and a *non-monotonic* pipelining sweep. One root cause: the Log's internal
+group-commit timer and the broker's timer both fired — first append after a quiet
+gap paid a stray mid-batch F_FULLFSYNC. Fix: the partition thread owns time-based
+flushing exclusively (Log keeps only the byte trigger). written b100 279k → 517k
+rec/s; durable b1000 40k → 56k; sweep became monotonic. Lesson: two owners of one
+timer = a quiet cost doubling only a benchmark can see.
+
+**Numbers (localhost, 100 B values, one partition, fsync batch:1MiB:5ms;
+`bench/run_broker_bench.sh`):** sync batch curve written 21.8k → 553k rec/s
+(b1→b1000), durable 91 → 56k rec/s (one flush covers the batch; p50 stays ~11–18 ms
+— the group-commit window + barrier). Pipelining (b100): 526k → 646k rec/s,
+saturating on the single partition writer — by design; partitions are the scaling
+knob (Stage 3). Open-loop rows (no coordinated omission): durable@20k/s p99 = 85 ms
+vs closed-loop 27 ms — F_FULLFSYNC variance stacks into the tail under sustained
+load.
+
+**Stage 2 exit review vs SPEC:** end-to-end produce→fetch ✅ (byte-identical 5k
+round trip) · consumer resumes from committed offset after restart ✅ (broker
+restarted too; `__offsets` replay verified) · bench throughput vs batch size +
+latency percentiles at fixed rate ✅ (open-loop mode). Stage 2 closed.
+
+**Next:** interview PDF first compile (Stage 2 milestone), then Stage 3 planning
+(partitions + consumer groups + rebalance + checker v1).
