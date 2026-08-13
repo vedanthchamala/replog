@@ -26,7 +26,10 @@ use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 use tokio::sync::watch;
 use tokio::task::{JoinHandle, JoinSet};
 
-use crate::proto::{self, Acks, ErrorCode, FetchedRecord, Request, Response};
+use crate::proto::{
+    self, Acks, ClusterMeta, ErrorCode, FetchedRecord, PartitionMeta, Request, Response,
+    TopicMeta,
+};
 use crate::storage::LogConfig;
 use offsets::{OFFSETS_TOPIC, OffsetsStore};
 
@@ -50,6 +53,7 @@ pub struct BrokerConfig {
 
 struct Shared {
     config: BrokerConfig,
+    advertised: String,
     topics: RwLock<HashMap<String, Arc<Vec<PartitionHandle>>>>,
     offsets: OffsetsStore,
     groups: GroupCoordinator,
@@ -100,6 +104,7 @@ impl Broker {
         let addr = listener.local_addr()?;
         let shared = Arc::new(Shared {
             config,
+            advertised: addr.to_string(),
             topics: RwLock::new(
                 topics
                     .into_iter()
@@ -294,16 +299,33 @@ impl Shared {
         ErrorCode::None
     }
 
-    fn metadata(&self) -> Vec<(String, u32)> {
-        let mut out: Vec<(String, u32)> = self
+    /// Standalone-mode metadata: this broker (id 0) leads every partition at
+    /// epoch 0 with itself as the only replica.
+    fn metadata(&self) -> ClusterMeta {
+        let mut topics: Vec<TopicMeta> = self
             .topics
             .read()
             .unwrap()
             .iter()
-            .map(|(name, ps)| (name.clone(), ps.len() as u32))
+            .map(|(name, ps)| TopicMeta {
+                name: name.clone(),
+                partitions: (0..ps.len() as u32)
+                    .map(|partition| PartitionMeta {
+                        partition,
+                        leader: 0,
+                        leader_epoch: 0,
+                        replicas: vec![0],
+                        isr: vec![0],
+                    })
+                    .collect(),
+            })
             .collect();
-        out.sort();
-        out
+        topics.sort_by(|a, b| a.name.cmp(&b.name));
+        ClusterMeta {
+            version: 0,
+            brokers: vec![(0, self.advertised.clone())],
+            topics,
+        }
     }
 }
 
@@ -359,8 +381,18 @@ fn respond(out: &UnboundedSender<Vec<u8>>, resp: &Response, corr: u32) {
 /// the reply-awaiting happens in spawned tasks.
 fn dispatch(shared: &Arc<Shared>, req: Request, corr: u32, out: &UnboundedSender<Vec<u8>>) {
     match req {
-        Request::CreateTopic { topic, partitions } => {
-            let error = shared.create_topic(&topic, partitions);
+        Request::CreateTopic {
+            topic,
+            partitions,
+            replication_factor,
+        } => {
+            // Standalone broker cannot host replicas; a cluster routes topic
+            // creation through the controller instead.
+            let error = if replication_factor > 1 {
+                ErrorCode::Malformed
+            } else {
+                shared.create_topic(&topic, partitions)
+            };
             respond(out, &Response::CreateTopic { error }, corr);
         }
         Request::Metadata => {
@@ -368,7 +400,7 @@ fn dispatch(shared: &Arc<Shared>, req: Request, corr: u32, out: &UnboundedSender
                 out,
                 &Response::Metadata {
                     error: ErrorCode::None,
-                    topics: shared.metadata(),
+                    cluster: shared.metadata(),
                 },
                 corr,
             );
@@ -377,8 +409,23 @@ fn dispatch(shared: &Arc<Shared>, req: Request, corr: u32, out: &UnboundedSender
             topic,
             partition,
             acks,
+            leader_epoch,
             records,
         } => {
+            if leader_epoch != 0 {
+                if acks != Acks::None {
+                    respond(
+                        out,
+                        &Response::Produce {
+                            error: ErrorCode::FencedEpoch,
+                            base_offset: 0,
+                            count: 0,
+                        },
+                        corr,
+                    );
+                }
+                return;
+            }
             let Some(handle) = shared.partition(&topic, partition) else {
                 if acks != Acks::None {
                     respond(
@@ -513,6 +560,71 @@ fn dispatch(shared: &Arc<Shared>, req: Request, corr: u32, out: &UnboundedSender
             let counts = |t: &str| shared.topic_partitions(t);
             let error = shared.groups.leave(&group, &member_id, &counts);
             respond(out, &Response::LeaveGroup { error }, corr);
+        }
+        // Replication traffic reaches a standalone broker only by mistake.
+        Request::ReplicaFetch { .. } => {
+            respond(
+                out,
+                &Response::ReplicaFetch {
+                    error: ErrorCode::NotLeader,
+                    leader_epoch: 0,
+                    log_end: 0,
+                    high_watermark: 0,
+                    records: Vec::new(),
+                },
+                corr,
+            );
+        }
+        Request::EpochCheck { .. } => {
+            respond(
+                out,
+                &Response::EpochCheck {
+                    error: ErrorCode::NotLeader,
+                    end_offset: 0,
+                },
+                corr,
+            );
+        }
+        // Controller-plane messages belong to the controller process.
+        Request::RegisterBroker { .. } => {
+            respond(
+                out,
+                &Response::RegisterBroker {
+                    error: ErrorCode::Malformed,
+                    metadata_version: 0,
+                },
+                corr,
+            );
+        }
+        Request::BrokerHeartbeat { .. } => {
+            respond(
+                out,
+                &Response::BrokerHeartbeat {
+                    error: ErrorCode::Malformed,
+                    metadata_version: 0,
+                },
+                corr,
+            );
+        }
+        Request::AlterIsr { .. } => {
+            respond(
+                out,
+                &Response::AlterIsr {
+                    error: ErrorCode::Malformed,
+                    metadata_version: 0,
+                },
+                corr,
+            );
+        }
+        Request::ControllerMetadata => {
+            respond(
+                out,
+                &Response::ControllerMetadata {
+                    error: ErrorCode::Malformed,
+                    cluster: ClusterMeta::default(),
+                },
+                corr,
+            );
         }
     }
 }

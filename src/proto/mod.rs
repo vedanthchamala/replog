@@ -32,6 +32,12 @@ const MSG_FETCH_OFFSET: u8 = 6;
 const MSG_JOIN_GROUP: u8 = 7;
 const MSG_HEARTBEAT: u8 = 8;
 const MSG_LEAVE_GROUP: u8 = 9;
+const MSG_REPLICA_FETCH: u8 = 10;
+const MSG_EPOCH_CHECK: u8 = 11;
+const MSG_REGISTER_BROKER: u8 = 12;
+const MSG_BROKER_HEARTBEAT: u8 = 13;
+const MSG_ALTER_ISR: u8 = 14;
+const MSG_CONTROLLER_METADATA: u8 = 15;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProtoError {
@@ -60,6 +66,14 @@ pub enum ErrorCode {
     /// The caller's group generation is behind: a rebalance happened. The
     /// only correct reaction is to rejoin and pick up the new assignment.
     StaleGeneration = 7,
+    /// This broker does not lead the partition; refresh metadata and retry.
+    NotLeader = 8,
+    /// The caller's leader epoch is behind the partition's current epoch.
+    FencedEpoch = 9,
+    /// acks=all rejected: the ISR is smaller than min_insync_replicas.
+    NotEnoughReplicas = 10,
+    /// The partition has no live leader (no unclean election).
+    Offline = 11,
 }
 
 impl ErrorCode {
@@ -73,6 +87,10 @@ impl ErrorCode {
             5 => Self::TopicExists,
             6 => Self::UnknownMember,
             7 => Self::StaleGeneration,
+            8 => Self::NotLeader,
+            9 => Self::FencedEpoch,
+            10 => Self::NotEnoughReplicas,
+            11 => Self::Offline,
             _ => return Err(ProtoError::Malformed(format!("unknown error code {v}"))),
         })
     }
@@ -93,6 +111,9 @@ pub enum Acks {
     Written = 1,
     /// Acked once the covering flush has reached stable media.
     Durable = 2,
+    /// Acked once every in-sync replica has the record (HWM has passed it).
+    /// Durability by replication — followers ack on write, not flush.
+    All = 3,
 }
 
 impl Acks {
@@ -101,9 +122,104 @@ impl Acks {
             0 => Self::None,
             1 => Self::Written,
             2 => Self::Durable,
+            3 => Self::All,
             _ => return Err(ProtoError::Malformed(format!("unknown acks value {v}"))),
         })
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartitionMeta {
+    pub partition: u32,
+    /// Leading broker id, or -1 when the partition is offline.
+    pub leader: i32,
+    pub leader_epoch: u64,
+    pub replicas: Vec<u32>,
+    pub isr: Vec<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TopicMeta {
+    pub name: String,
+    pub partitions: Vec<PartitionMeta>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ClusterMeta {
+    pub version: u64,
+    pub brokers: Vec<(u32, String)>,
+    pub topics: Vec<TopicMeta>,
+}
+
+fn put_cluster_meta(out: &mut Vec<u8>, meta: &ClusterMeta) {
+    wire::put_u64(out, meta.version);
+    wire::put_u32(out, meta.brokers.len() as u32);
+    for (id, addr) in &meta.brokers {
+        wire::put_u32(out, *id);
+        wire::put_str(out, addr);
+    }
+    wire::put_u32(out, meta.topics.len() as u32);
+    for topic in &meta.topics {
+        wire::put_str(out, &topic.name);
+        wire::put_u32(out, topic.partitions.len() as u32);
+        for p in &topic.partitions {
+            wire::put_u32(out, p.partition);
+            wire::put_i32(out, p.leader);
+            wire::put_u64(out, p.leader_epoch);
+            wire::put_u32(out, p.replicas.len() as u32);
+            for r in &p.replicas {
+                wire::put_u32(out, *r);
+            }
+            wire::put_u32(out, p.isr.len() as u32);
+            for r in &p.isr {
+                wire::put_u32(out, *r);
+            }
+        }
+    }
+}
+
+fn read_cluster_meta(r: &mut wire::Reader<'_>) -> Result<ClusterMeta> {
+    let version = r.u64()?;
+    let broker_count = r.u32()?;
+    let mut brokers = Vec::new();
+    for _ in 0..broker_count {
+        brokers.push((r.u32()?, r.string()?));
+    }
+    let topic_count = r.u32()?;
+    let mut topics = Vec::new();
+    for _ in 0..topic_count {
+        let name = r.string()?;
+        let partition_count = r.u32()?;
+        let mut partitions = Vec::new();
+        for _ in 0..partition_count {
+            let partition = r.u32()?;
+            let leader = r.i32()?;
+            let leader_epoch = r.u64()?;
+            let replica_count = r.u32()?;
+            let mut replicas = Vec::new();
+            for _ in 0..replica_count {
+                replicas.push(r.u32()?);
+            }
+            let isr_count = r.u32()?;
+            let mut isr = Vec::new();
+            for _ in 0..isr_count {
+                isr.push(r.u32()?);
+            }
+            partitions.push(PartitionMeta {
+                partition,
+                leader,
+                leader_epoch,
+                replicas,
+                isr,
+            });
+        }
+        topics.push(TopicMeta { name, partitions });
+    }
+    Ok(ClusterMeta {
+        version,
+        brokers,
+        topics,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -125,12 +241,17 @@ pub enum Request {
     CreateTopic {
         topic: String,
         partitions: u32,
+        /// 0 is treated as 1 (standalone-era clients).
+        replication_factor: u32,
     },
     Metadata,
     Produce {
         topic: String,
         partition: u32,
         acks: Acks,
+        /// The leader epoch the client believes; 0 = don't care. A stale
+        /// nonzero epoch is rejected with FencedEpoch.
+        leader_epoch: u64,
         records: Vec<ProduceRecord>,
     },
     Fetch {
@@ -140,6 +261,37 @@ pub enum Request {
         max_bytes: u32,
         max_wait_ms: u32,
     },
+    ReplicaFetch {
+        topic: String,
+        partition: u32,
+        follower_id: u32,
+        leader_epoch: u64,
+        offset: u64,
+        max_bytes: u32,
+        max_wait_ms: u32,
+    },
+    /// "Where did `epoch` end in your history?" — asked by a new follower
+    /// before fetching, so it can truncate a divergent suffix.
+    EpochCheck {
+        topic: String,
+        partition: u32,
+        epoch: u64,
+    },
+    RegisterBroker {
+        broker_id: u32,
+        addr: String,
+    },
+    BrokerHeartbeat {
+        broker_id: u32,
+        metadata_version: u64,
+    },
+    AlterIsr {
+        topic: String,
+        partition: u32,
+        leader_epoch: u64,
+        isr: Vec<u32>,
+    },
+    ControllerMetadata,
     CommitOffset {
         group: String,
         topic: String,
@@ -181,7 +333,7 @@ pub enum Response {
     },
     Metadata {
         error: ErrorCode,
-        topics: Vec<(String, u32)>,
+        cluster: ClusterMeta,
     },
     Produce {
         error: ErrorCode,
@@ -191,8 +343,37 @@ pub enum Response {
     Fetch {
         error: ErrorCode,
         log_start: u64,
+        /// Consumers may read up to here (exclusive). With replication this
+        /// is the high-water mark, not the log end.
         next_offset: u64,
         records: Vec<FetchedRecord>,
+    },
+    ReplicaFetch {
+        error: ErrorCode,
+        leader_epoch: u64,
+        log_end: u64,
+        high_watermark: u64,
+        records: Vec<FetchedRecord>,
+    },
+    EpochCheck {
+        error: ErrorCode,
+        end_offset: u64,
+    },
+    RegisterBroker {
+        error: ErrorCode,
+        metadata_version: u64,
+    },
+    BrokerHeartbeat {
+        error: ErrorCode,
+        metadata_version: u64,
+    },
+    AlterIsr {
+        error: ErrorCode,
+        metadata_version: u64,
+    },
+    ControllerMetadata {
+        error: ErrorCode,
+        cluster: ClusterMeta,
     },
     CommitOffset {
         error: ErrorCode,
@@ -232,10 +413,15 @@ fn finish_frame(mut out: Vec<u8>) -> Vec<u8> {
 pub fn encode_request(req: &Request, correlation_id: u32) -> Vec<u8> {
     let mut out = Vec::with_capacity(64);
     match req {
-        Request::CreateTopic { topic, partitions } => {
+        Request::CreateTopic {
+            topic,
+            partitions,
+            replication_factor,
+        } => {
             frame_header(&mut out, MSG_CREATE_TOPIC, correlation_id);
             wire::put_str(&mut out, topic);
             wire::put_u32(&mut out, *partitions);
+            wire::put_u32(&mut out, *replication_factor);
         }
         Request::Metadata => {
             frame_header(&mut out, MSG_METADATA, correlation_id);
@@ -244,17 +430,78 @@ pub fn encode_request(req: &Request, correlation_id: u32) -> Vec<u8> {
             topic,
             partition,
             acks,
+            leader_epoch,
             records,
         } => {
             frame_header(&mut out, MSG_PRODUCE, correlation_id);
             wire::put_str(&mut out, topic);
             wire::put_u32(&mut out, *partition);
             wire::put_u8(&mut out, *acks as u8);
+            wire::put_u64(&mut out, *leader_epoch);
             wire::put_u32(&mut out, records.len() as u32);
             for r in records {
                 wire::put_opt_bytes(&mut out, r.key.as_deref());
                 wire::put_bytes(&mut out, &r.value);
             }
+        }
+        Request::ReplicaFetch {
+            topic,
+            partition,
+            follower_id,
+            leader_epoch,
+            offset,
+            max_bytes,
+            max_wait_ms,
+        } => {
+            frame_header(&mut out, MSG_REPLICA_FETCH, correlation_id);
+            wire::put_str(&mut out, topic);
+            wire::put_u32(&mut out, *partition);
+            wire::put_u32(&mut out, *follower_id);
+            wire::put_u64(&mut out, *leader_epoch);
+            wire::put_u64(&mut out, *offset);
+            wire::put_u32(&mut out, *max_bytes);
+            wire::put_u32(&mut out, *max_wait_ms);
+        }
+        Request::EpochCheck {
+            topic,
+            partition,
+            epoch,
+        } => {
+            frame_header(&mut out, MSG_EPOCH_CHECK, correlation_id);
+            wire::put_str(&mut out, topic);
+            wire::put_u32(&mut out, *partition);
+            wire::put_u64(&mut out, *epoch);
+        }
+        Request::RegisterBroker { broker_id, addr } => {
+            frame_header(&mut out, MSG_REGISTER_BROKER, correlation_id);
+            wire::put_u32(&mut out, *broker_id);
+            wire::put_str(&mut out, addr);
+        }
+        Request::BrokerHeartbeat {
+            broker_id,
+            metadata_version,
+        } => {
+            frame_header(&mut out, MSG_BROKER_HEARTBEAT, correlation_id);
+            wire::put_u32(&mut out, *broker_id);
+            wire::put_u64(&mut out, *metadata_version);
+        }
+        Request::AlterIsr {
+            topic,
+            partition,
+            leader_epoch,
+            isr,
+        } => {
+            frame_header(&mut out, MSG_ALTER_ISR, correlation_id);
+            wire::put_str(&mut out, topic);
+            wire::put_u32(&mut out, *partition);
+            wire::put_u64(&mut out, *leader_epoch);
+            wire::put_u32(&mut out, isr.len() as u32);
+            for id in isr {
+                wire::put_u32(&mut out, *id);
+            }
+        }
+        Request::ControllerMetadata => {
+            frame_header(&mut out, MSG_CONTROLLER_METADATA, correlation_id);
         }
         Request::Fetch {
             topic,
@@ -337,14 +584,64 @@ pub fn encode_response(resp: &Response, correlation_id: u32) -> Vec<u8> {
             frame_header(&mut out, MSG_CREATE_TOPIC | RESPONSE_BIT, correlation_id);
             wire::put_u16(&mut out, *error as u16);
         }
-        Response::Metadata { error, topics } => {
+        Response::Metadata { error, cluster } => {
             frame_header(&mut out, MSG_METADATA | RESPONSE_BIT, correlation_id);
             wire::put_u16(&mut out, *error as u16);
-            wire::put_u32(&mut out, topics.len() as u32);
-            for (name, partitions) in topics {
-                wire::put_str(&mut out, name);
-                wire::put_u32(&mut out, *partitions);
+            put_cluster_meta(&mut out, cluster);
+        }
+        Response::ReplicaFetch {
+            error,
+            leader_epoch,
+            log_end,
+            high_watermark,
+            records,
+        } => {
+            frame_header(&mut out, MSG_REPLICA_FETCH | RESPONSE_BIT, correlation_id);
+            wire::put_u16(&mut out, *error as u16);
+            wire::put_u64(&mut out, *leader_epoch);
+            wire::put_u64(&mut out, *log_end);
+            wire::put_u64(&mut out, *high_watermark);
+            wire::put_u32(&mut out, records.len() as u32);
+            for r in records {
+                wire::put_u64(&mut out, r.offset);
+                wire::put_i64(&mut out, r.timestamp_ms);
+                wire::put_opt_bytes(&mut out, r.key.as_deref());
+                wire::put_bytes(&mut out, &r.value);
             }
+        }
+        Response::EpochCheck { error, end_offset } => {
+            frame_header(&mut out, MSG_EPOCH_CHECK | RESPONSE_BIT, correlation_id);
+            wire::put_u16(&mut out, *error as u16);
+            wire::put_u64(&mut out, *end_offset);
+        }
+        Response::RegisterBroker {
+            error,
+            metadata_version,
+        } => {
+            frame_header(&mut out, MSG_REGISTER_BROKER | RESPONSE_BIT, correlation_id);
+            wire::put_u16(&mut out, *error as u16);
+            wire::put_u64(&mut out, *metadata_version);
+        }
+        Response::BrokerHeartbeat {
+            error,
+            metadata_version,
+        } => {
+            frame_header(&mut out, MSG_BROKER_HEARTBEAT | RESPONSE_BIT, correlation_id);
+            wire::put_u16(&mut out, *error as u16);
+            wire::put_u64(&mut out, *metadata_version);
+        }
+        Response::AlterIsr {
+            error,
+            metadata_version,
+        } => {
+            frame_header(&mut out, MSG_ALTER_ISR | RESPONSE_BIT, correlation_id);
+            wire::put_u16(&mut out, *error as u16);
+            wire::put_u64(&mut out, *metadata_version);
+        }
+        Response::ControllerMetadata { error, cluster } => {
+            frame_header(&mut out, MSG_CONTROLLER_METADATA | RESPONSE_BIT, correlation_id);
+            wire::put_u16(&mut out, *error as u16);
+            put_cluster_meta(&mut out, cluster);
         }
         Response::Produce {
             error,
@@ -429,12 +726,14 @@ pub fn decode_request(frame: &[u8]) -> Result<(u32, Request)> {
         MSG_CREATE_TOPIC => Request::CreateTopic {
             topic: r.string()?,
             partitions: r.u32()?,
+            replication_factor: r.u32()?,
         },
         MSG_METADATA => Request::Metadata,
         MSG_PRODUCE => {
             let topic = r.string()?;
             let partition = r.u32()?;
             let acks = Acks::from_u8(r.u8()?)?;
+            let leader_epoch = r.u64()?;
             let count = r.u32()?;
             let mut records = Vec::new();
             for _ in 0..count {
@@ -447,9 +746,49 @@ pub fn decode_request(frame: &[u8]) -> Result<(u32, Request)> {
                 topic,
                 partition,
                 acks,
+                leader_epoch,
                 records,
             }
         }
+        MSG_REPLICA_FETCH => Request::ReplicaFetch {
+            topic: r.string()?,
+            partition: r.u32()?,
+            follower_id: r.u32()?,
+            leader_epoch: r.u64()?,
+            offset: r.u64()?,
+            max_bytes: r.u32()?,
+            max_wait_ms: r.u32()?,
+        },
+        MSG_EPOCH_CHECK => Request::EpochCheck {
+            topic: r.string()?,
+            partition: r.u32()?,
+            epoch: r.u64()?,
+        },
+        MSG_REGISTER_BROKER => Request::RegisterBroker {
+            broker_id: r.u32()?,
+            addr: r.string()?,
+        },
+        MSG_BROKER_HEARTBEAT => Request::BrokerHeartbeat {
+            broker_id: r.u32()?,
+            metadata_version: r.u64()?,
+        },
+        MSG_ALTER_ISR => {
+            let topic = r.string()?;
+            let partition = r.u32()?;
+            let leader_epoch = r.u64()?;
+            let count = r.u32()?;
+            let mut isr = Vec::new();
+            for _ in 0..count {
+                isr.push(r.u32()?);
+            }
+            Request::AlterIsr {
+                topic,
+                partition,
+                leader_epoch,
+                isr,
+            }
+        }
+        MSG_CONTROLLER_METADATA => Request::ControllerMetadata,
         MSG_FETCH => Request::Fetch {
             topic: r.string()?,
             partition: r.u32()?,
@@ -509,15 +848,53 @@ pub fn decode_response(frame: &[u8]) -> Result<(u32, Response)> {
         t if t == MSG_CREATE_TOPIC | RESPONSE_BIT => Response::CreateTopic {
             error: ErrorCode::from_u16(r.u16()?)?,
         },
-        t if t == MSG_METADATA | RESPONSE_BIT => {
+        t if t == MSG_METADATA | RESPONSE_BIT => Response::Metadata {
+            error: ErrorCode::from_u16(r.u16()?)?,
+            cluster: read_cluster_meta(&mut r)?,
+        },
+        t if t == MSG_REPLICA_FETCH | RESPONSE_BIT => {
             let error = ErrorCode::from_u16(r.u16()?)?;
+            let leader_epoch = r.u64()?;
+            let log_end = r.u64()?;
+            let high_watermark = r.u64()?;
             let count = r.u32()?;
-            let mut topics = Vec::new();
+            let mut records = Vec::new();
             for _ in 0..count {
-                topics.push((r.string()?, r.u32()?));
+                records.push(FetchedRecord {
+                    offset: r.u64()?,
+                    timestamp_ms: r.i64()?,
+                    key: r.opt_bytes()?,
+                    value: r.bytes()?,
+                });
             }
-            Response::Metadata { error, topics }
+            Response::ReplicaFetch {
+                error,
+                leader_epoch,
+                log_end,
+                high_watermark,
+                records,
+            }
         }
+        t if t == MSG_EPOCH_CHECK | RESPONSE_BIT => Response::EpochCheck {
+            error: ErrorCode::from_u16(r.u16()?)?,
+            end_offset: r.u64()?,
+        },
+        t if t == MSG_REGISTER_BROKER | RESPONSE_BIT => Response::RegisterBroker {
+            error: ErrorCode::from_u16(r.u16()?)?,
+            metadata_version: r.u64()?,
+        },
+        t if t == MSG_BROKER_HEARTBEAT | RESPONSE_BIT => Response::BrokerHeartbeat {
+            error: ErrorCode::from_u16(r.u16()?)?,
+            metadata_version: r.u64()?,
+        },
+        t if t == MSG_ALTER_ISR | RESPONSE_BIT => Response::AlterIsr {
+            error: ErrorCode::from_u16(r.u16()?)?,
+            metadata_version: r.u64()?,
+        },
+        t if t == MSG_CONTROLLER_METADATA | RESPONSE_BIT => Response::ControllerMetadata {
+            error: ErrorCode::from_u16(r.u16()?)?,
+            cluster: read_cluster_meta(&mut r)?,
+        },
         t if t == MSG_PRODUCE | RESPONSE_BIT => Response::Produce {
             error: ErrorCode::from_u16(r.u16()?)?,
             base_offset: r.u64()?,
@@ -631,12 +1008,14 @@ mod tests {
         roundtrip_request(Request::CreateTopic {
             topic: "orders".into(),
             partitions: 8,
+            replication_factor: 3,
         });
         roundtrip_request(Request::Metadata);
         roundtrip_request(Request::Produce {
             topic: "orders".into(),
             partition: 3,
-            acks: Acks::Durable,
+            acks: Acks::All,
+            leader_epoch: 7,
             records: vec![
                 ProduceRecord {
                     key: None,
@@ -648,6 +1027,35 @@ mod tests {
                 },
             ],
         });
+        roundtrip_request(Request::ReplicaFetch {
+            topic: "t".into(),
+            partition: 2,
+            follower_id: 1,
+            leader_epoch: 5,
+            offset: 900,
+            max_bytes: 1 << 20,
+            max_wait_ms: 250,
+        });
+        roundtrip_request(Request::EpochCheck {
+            topic: "t".into(),
+            partition: 0,
+            epoch: 4,
+        });
+        roundtrip_request(Request::RegisterBroker {
+            broker_id: 2,
+            addr: "127.0.0.1:9202".into(),
+        });
+        roundtrip_request(Request::BrokerHeartbeat {
+            broker_id: 2,
+            metadata_version: 17,
+        });
+        roundtrip_request(Request::AlterIsr {
+            topic: "t".into(),
+            partition: 1,
+            leader_epoch: 5,
+            isr: vec![0, 2],
+        });
+        roundtrip_request(Request::ControllerMetadata);
         roundtrip_request(Request::Fetch {
             topic: "t".into(),
             partition: 0,
@@ -690,9 +1098,64 @@ mod tests {
         roundtrip_response(Response::CreateTopic {
             error: ErrorCode::TopicExists,
         });
+        let cluster = ClusterMeta {
+            version: 12,
+            brokers: vec![(0, "127.0.0.1:9200".into()), (1, "127.0.0.1:9201".into())],
+            topics: vec![TopicMeta {
+                name: "orders".into(),
+                partitions: vec![
+                    PartitionMeta {
+                        partition: 0,
+                        leader: 1,
+                        leader_epoch: 3,
+                        replicas: vec![0, 1],
+                        isr: vec![1],
+                    },
+                    PartitionMeta {
+                        partition: 1,
+                        leader: -1,
+                        leader_epoch: 9,
+                        replicas: vec![0, 1],
+                        isr: vec![],
+                    },
+                ],
+            }],
+        };
         roundtrip_response(Response::Metadata {
             error: ErrorCode::None,
-            topics: vec![("a".into(), 1), ("b".into(), 16)],
+            cluster: cluster.clone(),
+        });
+        roundtrip_response(Response::ControllerMetadata {
+            error: ErrorCode::None,
+            cluster,
+        });
+        roundtrip_response(Response::ReplicaFetch {
+            error: ErrorCode::None,
+            leader_epoch: 4,
+            log_end: 1000,
+            high_watermark: 990,
+            records: vec![FetchedRecord {
+                offset: 998,
+                timestamp_ms: 55,
+                key: None,
+                value: b"r".to_vec(),
+            }],
+        });
+        roundtrip_response(Response::EpochCheck {
+            error: ErrorCode::None,
+            end_offset: 456,
+        });
+        roundtrip_response(Response::RegisterBroker {
+            error: ErrorCode::None,
+            metadata_version: 3,
+        });
+        roundtrip_response(Response::BrokerHeartbeat {
+            error: ErrorCode::FencedEpoch,
+            metadata_version: 4,
+        });
+        roundtrip_response(Response::AlterIsr {
+            error: ErrorCode::NotLeader,
+            metadata_version: 5,
         });
         roundtrip_response(Response::Produce {
             error: ErrorCode::None,
@@ -737,6 +1200,7 @@ mod tests {
             topic: "t".into(),
             partition: 0,
             acks: Acks::Written,
+            leader_epoch: 0,
             records: vec![ProduceRecord {
                 key: Some(b"key".to_vec()),
                 value: b"value".to_vec(),

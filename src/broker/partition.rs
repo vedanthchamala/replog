@@ -213,7 +213,11 @@ fn run(mut log: Log, rx: Receiver<Cmd>, watch_tx: watch::Sender<u64>, policy: Fs
                                 Acks::None | Acks::Written => true,
                                 // A broker that never flushes cannot promise
                                 // more than "written"; don't strand the ack.
-                                Acks::Durable => matches!(policy, FsyncPolicy::Os)
+                                // acks=all reaching this actor means a single
+                                // replica: local-durable is the strongest
+                                // guarantee available (the replication layer
+                                // holds ISR acks above this level).
+                                Acks::Durable | Acks::All => matches!(policy, FsyncPolicy::Os)
                                     || log.durable_offset().is_some_and(|d| d >= last),
                             };
                             if acked_now {

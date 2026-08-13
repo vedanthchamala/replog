@@ -19,7 +19,7 @@ use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 use tokio::sync::oneshot;
 
 use crate::proto::{
-    self, Acks, ErrorCode, FetchedRecord, ProduceRecord, Request, Response,
+    self, Acks, ClusterMeta, ErrorCode, FetchedRecord, ProduceRecord, Request, Response,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -122,10 +122,20 @@ impl Connection {
     }
 
     pub async fn create_topic(&self, topic: &str, partitions: u32) -> Result<()> {
+        self.create_topic_replicated(topic, partitions, 1).await
+    }
+
+    pub async fn create_topic_replicated(
+        &self,
+        topic: &str,
+        partitions: u32,
+        replication_factor: u32,
+    ) -> Result<()> {
         match self
             .call(&Request::CreateTopic {
                 topic: topic.to_string(),
                 partitions,
+                replication_factor,
             })
             .await?
         {
@@ -137,12 +147,12 @@ impl Connection {
         }
     }
 
-    pub async fn metadata(&self) -> Result<Vec<(String, u32)>> {
+    pub async fn metadata(&self) -> Result<ClusterMeta> {
         match self.call(&Request::Metadata).await? {
             Response::Metadata {
                 error: ErrorCode::None,
-                topics,
-            } => Ok(topics),
+                cluster,
+            } => Ok(cluster),
             Response::Metadata { error, .. } => Err(ClientError::Broker(error)),
             _ => Err(ClientError::UnexpectedResponse),
         }
@@ -156,10 +166,23 @@ impl Connection {
         acks: Acks,
         records: Vec<ProduceRecord>,
     ) -> Result<Option<u64>> {
+        self.produce_with_epoch(topic, partition, acks, 0, records)
+            .await
+    }
+
+    pub async fn produce_with_epoch(
+        &self,
+        topic: &str,
+        partition: u32,
+        acks: Acks,
+        leader_epoch: u64,
+        records: Vec<ProduceRecord>,
+    ) -> Result<Option<u64>> {
         let req = Request::Produce {
             topic: topic.to_string(),
             partition,
             acks,
+            leader_epoch,
             records,
         };
         if acks == Acks::None {
@@ -353,9 +376,10 @@ impl TopicProducer {
         let partitions = conn
             .metadata()
             .await?
+            .topics
             .into_iter()
-            .find(|(t, _)| *t == topic)
-            .map(|(_, n)| n)
+            .find(|t| t.name == topic)
+            .map(|t| t.partitions.len() as u32)
             .ok_or(ClientError::Broker(ErrorCode::UnknownTopicOrPartition))?;
         Ok(Self {
             conn,

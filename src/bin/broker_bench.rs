@@ -144,6 +144,7 @@ async fn run(args: &Args) -> Result<String, String> {
         topic: "bench".into(),
         partition: (batch_index as u32) % args.partitions,
         acks: args.acks,
+        leader_epoch: 0,
         records: (0..args.batch_records)
             .map(|_| ProduceRecord {
                 key: None,

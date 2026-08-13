@@ -42,7 +42,10 @@ async fn produce_fetch_roundtrip_and_metadata() {
         conn.create_topic("events", 2).await,
         Err(replog::client::ClientError::Broker(ErrorCode::TopicExists))
     ));
-    assert_eq!(conn.metadata().await.unwrap(), vec![("events".into(), 2)]);
+    let cluster = conn.metadata().await.unwrap();
+    assert_eq!(cluster.topics.len(), 1);
+    assert_eq!(cluster.topics[0].name, "events");
+    assert_eq!(cluster.topics[0].partitions.len(), 2);
 
     let make_record = |i: usize| ProduceRecord {
         key: match i % 3 {
@@ -176,6 +179,7 @@ async fn pipelined_produces_stay_ordered() {
             topic: "t".into(),
             partition: 0,
             acks: Acks::Written,
+            leader_epoch: 0,
             records: vec![ProduceRecord {
                 key: None,
                 value: i.to_le_bytes().to_vec(),
