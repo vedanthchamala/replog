@@ -117,7 +117,7 @@ group commit buys back.
 
 ---
 
-## Stage 2 (ACTIVE) — TCP broker + clients
+## Stage 2 (DONE 2026-08-13) — TCP broker + clients
 
 tokio broker + hand-rolled binary protocol + producer/consumer clients. The stage's
 point: the ack contract (when is a produce "accepted"?) becomes real — under group
@@ -219,12 +219,93 @@ Error codes (u16): 0 ok, 1 unknown topic/partition, 2 offset out of range,
 Headline: what client-side batching buys over TCP, and what the durable-ack
 contract costs vs written-ack.
 
-## Stage 3 (skeleton) — partitions + consumer groups
+## Stage 3 (ACTIVE) — partitions + consumer groups
 
-- Topics with N partitions; producer partitioner = hash(key) % N, round-robin for null.
-- Group coordinator on the broker: join/leave/heartbeat, generation numbers, range
-  assignment, rebalance on membership change; fencing by generation on offset commits.
-- Checker v1: at-least-once delivery of every produced record across a rebalance.
+The stage's point: load sharing with a correctness contract. N consumers split a
+topic's partitions; membership changes (join, leave, crash) trigger rebalance; a
+checker — not an assertion — verifies at-least-once delivery across the rebalance.
+Zombie fencing by generation number is the first appearance of the fencing idea
+that Stage 4 escalates to leader epochs.
+
+### Producer partitioner (client side)
+
+`TopicProducer`: partition count from Metadata at creation; `hash(key) % N`
+(crc32 — stable and already a dependency; Kafka uses murmur2, same idea), null
+keys round-robin. Per-partition batch buffers, flushed at `batch_records` or on
+`flush()`.
+
+### Group coordinator (broker side, `src/broker/groups.rs`)
+
+Simplification vs Kafka, documented: the *broker* computes assignments (range
+assignment: for each topic, sorted partitions chunked across members sorted by
+id). Kafka ships assignment computation to a client "leader" (JoinGroup →
+SyncGroup two-phase) so strategies are pluggable without broker upgrades — replog
+doesn't need pluggable strategies, so one round trip and one owner of truth.
+
+State per group: `generation: u64`, members (id → subscribed topics, session
+timeout, last heartbeat). Rules:
+
+- **Join** (empty member_id = new): membership change → generation += 1,
+  recompute assignments; response carries member_id, generation, assignment.
+  Rejoin of an existing member returns current generation + assignment without
+  bumping (no rebalance storm).
+- **Heartbeat** carries (member_id, generation): unknown member → UnknownMember;
+  stale generation → StaleGeneration, the signal to rejoin. Otherwise refreshes
+  the liveness clock.
+- **Leave** removes the member → bump + recompute.
+- **Expiry**: a broker task sweeps groups every 200 ms; members silent past their
+  session timeout are removed → bump + recompute. A crashed consumer (no Leave)
+  is detected this way — measured in the eval as detection→reassignment time.
+- **Fenced commits**: CommitOffset now carries (member_id, generation); the
+  coordinator rejects stale/unknown ones (StaleGeneration/UnknownMember) so a
+  zombie kicked out by a rebalance cannot clobber offsets of its successor.
+  Empty member_id = unfenced standalone commit, still allowed (simple consumers).
+
+Protocol additions: JoinGroup (7), Heartbeat (8), LeaveGroup (9); CommitOffset
+gains member_id + generation; error codes UnknownMember (6), StaleGeneration (7).
+Pre-1.0: the CommitOffset format change rides VERSION 1 (no deployed peers).
+
+### Group consumer (client side)
+
+`GroupConsumer::join(conn, group, topics, session_timeout)` → assignment +
+per-partition positions from committed offsets (or 0). `poll()`: heartbeats at
+session_timeout/3 (poll-driven, like pre-KIP-62 Kafka — a stalled poll loop stops
+heartbeating and gets evicted, which is honest), fetches round-robin across
+assigned partitions, returns (topic, partition, record)s. StaleGeneration or
+UnknownMember at any point → rejoin + refresh positions. `commit()` = fenced
+commit of all positions.
+
+### Checker v1 (`src/checker/`)
+
+Library, not test glue — Stage 5 grows it into the offline history checker.
+`History` records every *acked* produce (unique id embedded in the value by the
+workload) and every consumed record (consumer name, id, topic, partition,
+offset). `verify()` reports: acked-but-never-consumed ids (at-least-once
+violations — must be empty), duplicate delivery count (allowed, counted
+honestly), per-(consumer, partition) offset monotonicity, and same-offset ⇒
+same-id consistency across consumers.
+
+### Tests (pass conditions in executable form)
+
+1. proto round-trips for the three new messages + extended CommitOffset.
+2. Partitioner: same key → same partition; null keys round-robin; all partitions
+   hit over 1k random keys.
+3. Assignment: 2 members × 4 partitions → disjoint, covering, 2+2; third joins →
+   generations bump, 2+1+1; leave → back to 2+2.
+4. Fencing: commit with a pre-rebalance generation → StaleGeneration, offset
+   unchanged.
+5. **The stage eval**: 4 partitions, keyed workload produced continuously; 2
+   GroupConsumers consume; consumer B is dropped without Leave (crash) →
+   session-timeout eviction → A absorbs all partitions; checker verifies zero
+   at-least-once violations across the rebalance, duplicates counted, offset
+   streams consistent. Detection→reassignment time printed.
+
+### Measurement (end of stage)
+
+Partition scaling on one broker: produce throughput vs partition count (1/2/4/8,
+batch=100, inflight=8, round-robin) at acks=written and acks=durable — validates
+"partitions are the scaling knob" from Stage 2 with numbers, and shows where one
+broker saturates.
 
 ## Stage 4 (skeleton) — replication + failover
 
