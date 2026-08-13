@@ -29,6 +29,9 @@ const MSG_PRODUCE: u8 = 3;
 const MSG_FETCH: u8 = 4;
 const MSG_COMMIT_OFFSET: u8 = 5;
 const MSG_FETCH_OFFSET: u8 = 6;
+const MSG_JOIN_GROUP: u8 = 7;
+const MSG_HEARTBEAT: u8 = 8;
+const MSG_LEAVE_GROUP: u8 = 9;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProtoError {
@@ -53,6 +56,10 @@ pub enum ErrorCode {
     Storage = 3,
     Malformed = 4,
     TopicExists = 5,
+    UnknownMember = 6,
+    /// The caller's group generation is behind: a rebalance happened. The
+    /// only correct reaction is to rejoin and pick up the new assignment.
+    StaleGeneration = 7,
 }
 
 impl ErrorCode {
@@ -64,6 +71,8 @@ impl ErrorCode {
             3 => Self::Storage,
             4 => Self::Malformed,
             5 => Self::TopicExists,
+            6 => Self::UnknownMember,
+            7 => Self::StaleGeneration,
             _ => return Err(ProtoError::Malformed(format!("unknown error code {v}"))),
         })
     }
@@ -136,11 +145,32 @@ pub enum Request {
         topic: String,
         partition: u32,
         offset: u64,
+        /// Empty = unfenced standalone commit. Otherwise the commit is
+        /// rejected unless (member_id, generation) match the group's current
+        /// membership — zombie fencing.
+        member_id: String,
+        generation: u64,
     },
     FetchOffset {
         group: String,
         topic: String,
         partition: u32,
+    },
+    JoinGroup {
+        group: String,
+        /// Empty = new member; the broker assigns an id.
+        member_id: String,
+        session_timeout_ms: u32,
+        topics: Vec<String>,
+    },
+    Heartbeat {
+        group: String,
+        member_id: String,
+        generation: u64,
+    },
+    LeaveGroup {
+        group: String,
+        member_id: String,
     },
 }
 
@@ -171,6 +201,18 @@ pub enum Response {
         error: ErrorCode,
         /// Committed offset, or -1 if the group has never committed.
         offset: i64,
+    },
+    JoinGroup {
+        error: ErrorCode,
+        member_id: String,
+        generation: u64,
+        assignment: Vec<(String, u32)>,
+    },
+    Heartbeat {
+        error: ErrorCode,
+    },
+    LeaveGroup {
+        error: ErrorCode,
     },
 }
 
@@ -233,12 +275,16 @@ pub fn encode_request(req: &Request, correlation_id: u32) -> Vec<u8> {
             topic,
             partition,
             offset,
+            member_id,
+            generation,
         } => {
             frame_header(&mut out, MSG_COMMIT_OFFSET, correlation_id);
             wire::put_str(&mut out, group);
             wire::put_str(&mut out, topic);
             wire::put_u32(&mut out, *partition);
             wire::put_u64(&mut out, *offset);
+            wire::put_str(&mut out, member_id);
+            wire::put_u64(&mut out, *generation);
         }
         Request::FetchOffset {
             group,
@@ -249,6 +295,36 @@ pub fn encode_request(req: &Request, correlation_id: u32) -> Vec<u8> {
             wire::put_str(&mut out, group);
             wire::put_str(&mut out, topic);
             wire::put_u32(&mut out, *partition);
+        }
+        Request::JoinGroup {
+            group,
+            member_id,
+            session_timeout_ms,
+            topics,
+        } => {
+            frame_header(&mut out, MSG_JOIN_GROUP, correlation_id);
+            wire::put_str(&mut out, group);
+            wire::put_str(&mut out, member_id);
+            wire::put_u32(&mut out, *session_timeout_ms);
+            wire::put_u32(&mut out, topics.len() as u32);
+            for t in topics {
+                wire::put_str(&mut out, t);
+            }
+        }
+        Request::Heartbeat {
+            group,
+            member_id,
+            generation,
+        } => {
+            frame_header(&mut out, MSG_HEARTBEAT, correlation_id);
+            wire::put_str(&mut out, group);
+            wire::put_str(&mut out, member_id);
+            wire::put_u64(&mut out, *generation);
+        }
+        Request::LeaveGroup { group, member_id } => {
+            frame_header(&mut out, MSG_LEAVE_GROUP, correlation_id);
+            wire::put_str(&mut out, group);
+            wire::put_str(&mut out, member_id);
         }
     }
     finish_frame(out)
@@ -307,6 +383,30 @@ pub fn encode_response(resp: &Response, correlation_id: u32) -> Vec<u8> {
             wire::put_u16(&mut out, *error as u16);
             wire::put_i64(&mut out, *offset);
         }
+        Response::JoinGroup {
+            error,
+            member_id,
+            generation,
+            assignment,
+        } => {
+            frame_header(&mut out, MSG_JOIN_GROUP | RESPONSE_BIT, correlation_id);
+            wire::put_u16(&mut out, *error as u16);
+            wire::put_str(&mut out, member_id);
+            wire::put_u64(&mut out, *generation);
+            wire::put_u32(&mut out, assignment.len() as u32);
+            for (topic, partition) in assignment {
+                wire::put_str(&mut out, topic);
+                wire::put_u32(&mut out, *partition);
+            }
+        }
+        Response::Heartbeat { error } => {
+            frame_header(&mut out, MSG_HEARTBEAT | RESPONSE_BIT, correlation_id);
+            wire::put_u16(&mut out, *error as u16);
+        }
+        Response::LeaveGroup { error } => {
+            frame_header(&mut out, MSG_LEAVE_GROUP | RESPONSE_BIT, correlation_id);
+            wire::put_u16(&mut out, *error as u16);
+        }
     }
     finish_frame(out)
 }
@@ -362,11 +462,38 @@ pub fn decode_request(frame: &[u8]) -> Result<(u32, Request)> {
             topic: r.string()?,
             partition: r.u32()?,
             offset: r.u64()?,
+            member_id: r.string()?,
+            generation: r.u64()?,
         },
         MSG_FETCH_OFFSET => Request::FetchOffset {
             group: r.string()?,
             topic: r.string()?,
             partition: r.u32()?,
+        },
+        MSG_JOIN_GROUP => {
+            let group = r.string()?;
+            let member_id = r.string()?;
+            let session_timeout_ms = r.u32()?;
+            let count = r.u32()?;
+            let mut topics = Vec::new();
+            for _ in 0..count {
+                topics.push(r.string()?);
+            }
+            Request::JoinGroup {
+                group,
+                member_id,
+                session_timeout_ms,
+                topics,
+            }
+        }
+        MSG_HEARTBEAT => Request::Heartbeat {
+            group: r.string()?,
+            member_id: r.string()?,
+            generation: r.u64()?,
+        },
+        MSG_LEAVE_GROUP => Request::LeaveGroup {
+            group: r.string()?,
+            member_id: r.string()?,
         },
         other => return Err(ProtoError::UnknownMsgType(other)),
     };
@@ -423,6 +550,28 @@ pub fn decode_response(frame: &[u8]) -> Result<(u32, Response)> {
         t if t == MSG_FETCH_OFFSET | RESPONSE_BIT => Response::FetchOffset {
             error: ErrorCode::from_u16(r.u16()?)?,
             offset: r.i64()?,
+        },
+        t if t == MSG_JOIN_GROUP | RESPONSE_BIT => {
+            let error = ErrorCode::from_u16(r.u16()?)?;
+            let member_id = r.string()?;
+            let generation = r.u64()?;
+            let count = r.u32()?;
+            let mut assignment = Vec::new();
+            for _ in 0..count {
+                assignment.push((r.string()?, r.u32()?));
+            }
+            Response::JoinGroup {
+                error,
+                member_id,
+                generation,
+                assignment,
+            }
+        }
+        t if t == MSG_HEARTBEAT | RESPONSE_BIT => Response::Heartbeat {
+            error: ErrorCode::from_u16(r.u16()?)?,
+        },
+        t if t == MSG_LEAVE_GROUP | RESPONSE_BIT => Response::LeaveGroup {
+            error: ErrorCode::from_u16(r.u16()?)?,
         },
         other => return Err(ProtoError::UnknownMsgType(other)),
     };
@@ -511,11 +660,28 @@ mod tests {
             topic: "t".into(),
             partition: 1,
             offset: 99,
+            member_id: "m-3".into(),
+            generation: 7,
         });
         roundtrip_request(Request::FetchOffset {
             group: "g".into(),
             topic: "t".into(),
             partition: 1,
+        });
+        roundtrip_request(Request::JoinGroup {
+            group: "g".into(),
+            member_id: String::new(),
+            session_timeout_ms: 3000,
+            topics: vec!["a".into(), "b".into()],
+        });
+        roundtrip_request(Request::Heartbeat {
+            group: "g".into(),
+            member_id: "m-1".into(),
+            generation: 4,
+        });
+        roundtrip_request(Request::LeaveGroup {
+            group: "g".into(),
+            member_id: "m-1".into(),
         });
     }
 
@@ -550,6 +716,18 @@ mod tests {
         roundtrip_response(Response::FetchOffset {
             error: ErrorCode::None,
             offset: -1,
+        });
+        roundtrip_response(Response::JoinGroup {
+            error: ErrorCode::None,
+            member_id: "m-2".into(),
+            generation: 9,
+            assignment: vec![("t".into(), 0), ("t".into(), 3)],
+        });
+        roundtrip_response(Response::Heartbeat {
+            error: ErrorCode::StaleGeneration,
+        });
+        roundtrip_response(Response::LeaveGroup {
+            error: ErrorCode::UnknownMember,
         });
     }
 

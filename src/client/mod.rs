@@ -1,8 +1,13 @@
-//! Client side: a pipelined connection plus thin Producer/Consumer wrappers.
+//! Client side: a pipelined connection plus Producer/Consumer wrappers and
+//! the group-membership consumer (`GroupConsumer`).
 //!
 //! `Connection` routes responses back to callers by correlation ID, so any
 //! number of requests can be in flight on one socket — the broker may answer
 //! them out of order (long-poll fetches) and each still lands with its caller.
+
+mod group;
+
+pub use group::GroupConsumer;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -202,6 +207,7 @@ impl Connection {
         }
     }
 
+    /// Unfenced commit (standalone consumers, no group membership).
     pub async fn commit_offset(
         &self,
         group: &str,
@@ -209,12 +215,27 @@ impl Connection {
         partition: u32,
         offset: u64,
     ) -> Result<()> {
+        self.commit_offset_fenced(group, topic, partition, offset, "", 0)
+            .await
+    }
+
+    pub async fn commit_offset_fenced(
+        &self,
+        group: &str,
+        topic: &str,
+        partition: u32,
+        offset: u64,
+        member_id: &str,
+        generation: u64,
+    ) -> Result<()> {
         match self
             .call(&Request::CommitOffset {
                 group: group.to_string(),
                 topic: topic.to_string(),
                 partition,
                 offset,
+                member_id: member_id.to_string(),
+                generation,
             })
             .await?
         {
@@ -299,6 +320,101 @@ impl Producer {
         self.conn
             .produce(&self.topic, self.partition, self.acks, records)
             .await
+    }
+}
+
+/// Which partition a key routes to: `crc32(key) % N`. Stable across producers
+/// and sessions, so one key's records always share a partition (and thus an
+/// order). Kafka uses murmur2 the same way.
+pub fn partition_for_key(key: &[u8], partitions: u32) -> u32 {
+    crc32fast::hash(key) % partitions
+}
+
+/// A topic-level producer that routes by key hash (round-robin for null keys)
+/// and keeps one batch buffer per partition.
+pub struct TopicProducer {
+    conn: Connection,
+    topic: String,
+    partitions: u32,
+    acks: Acks,
+    batch_records: usize,
+    buffers: Vec<Vec<ProduceRecord>>,
+    round_robin: usize,
+}
+
+impl TopicProducer {
+    pub async fn new(
+        conn: Connection,
+        topic: impl Into<String>,
+        acks: Acks,
+        batch_records: usize,
+    ) -> Result<Self> {
+        let topic = topic.into();
+        let partitions = conn
+            .metadata()
+            .await?
+            .into_iter()
+            .find(|(t, _)| *t == topic)
+            .map(|(_, n)| n)
+            .ok_or(ClientError::Broker(ErrorCode::UnknownTopicOrPartition))?;
+        Ok(Self {
+            conn,
+            topic,
+            partitions,
+            acks,
+            batch_records: batch_records.max(1),
+            buffers: (0..partitions).map(|_| Vec::new()).collect(),
+            round_robin: 0,
+        })
+    }
+
+    pub fn partitions(&self) -> u32 {
+        self.partitions
+    }
+
+    fn route(&mut self, key: Option<&[u8]>) -> u32 {
+        match key {
+            Some(k) => partition_for_key(k, self.partitions),
+            None => {
+                let p = (self.round_robin as u32) % self.partitions;
+                self.round_robin += 1;
+                p
+            }
+        }
+    }
+
+    /// Buffers one record; when its partition's batch fills, ships it and
+    /// returns `(partition, base_offset)` — every record buffered for that
+    /// partition so far is acked at that point.
+    pub async fn send(&mut self, key: Option<Vec<u8>>, value: Vec<u8>) -> Result<Option<(u32, u64)>> {
+        let p = self.route(key.as_deref());
+        self.buffers[p as usize].push(ProduceRecord { key, value });
+        if self.buffers[p as usize].len() >= self.batch_records {
+            let base = self.flush_partition(p).await?;
+            return Ok(base.map(|b| (p, b)));
+        }
+        Ok(None)
+    }
+
+    pub async fn flush_partition(&mut self, partition: u32) -> Result<Option<u64>> {
+        let records = std::mem::take(&mut self.buffers[partition as usize]);
+        if records.is_empty() {
+            return Ok(None);
+        }
+        self.conn
+            .produce(&self.topic, partition, self.acks, records)
+            .await
+    }
+
+    /// Flushes every partition's buffer; returns (partition, base_offset)s.
+    pub async fn flush(&mut self) -> Result<Vec<(u32, u64)>> {
+        let mut out = Vec::new();
+        for p in 0..self.partitions {
+            if let Some(base) = self.flush_partition(p).await? {
+                out.push((p, base));
+            }
+        }
+        Ok(out)
     }
 }
 

@@ -5,6 +5,7 @@
 //! torn tails, and fsync policy is an explicit, measured choice.
 
 pub mod broker;
+pub mod checker;
 pub mod client;
 pub mod proto;
 pub mod storage;

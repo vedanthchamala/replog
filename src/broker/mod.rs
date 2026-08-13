@@ -7,10 +7,13 @@
 //! through one writer task per connection and may interleave out of request
 //! order — correlation IDs are what make that safe.
 
+mod groups;
 mod offsets;
 mod partition;
 
 pub use partition::PartitionHandle;
+
+use groups::GroupCoordinator;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -49,6 +52,7 @@ struct Shared {
     config: BrokerConfig,
     topics: RwLock<HashMap<String, Arc<Vec<PartitionHandle>>>>,
     offsets: OffsetsStore,
+    groups: GroupCoordinator,
     threads: Mutex<Vec<std::thread::JoinHandle<()>>>,
 }
 
@@ -57,6 +61,7 @@ pub struct BrokerHandle {
     shared: Arc<Shared>,
     shutdown_tx: watch::Sender<bool>,
     accept_task: JoinHandle<()>,
+    expiry_task: JoinHandle<()>,
 }
 
 pub struct Broker;
@@ -102,9 +107,25 @@ impl Broker {
                     .collect(),
             ),
             offsets,
+            groups: GroupCoordinator::new(),
             threads: Mutex::new(threads),
         });
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let expiry_shared = shared.clone();
+        let mut expiry_shutdown = shutdown_rx.clone();
+        let expiry_task = tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_millis(200));
+            loop {
+                tokio::select! {
+                    _ = tick.tick() => {
+                        let counts = |t: &str| expiry_shared.topic_partitions(t);
+                        expiry_shared.groups.expire(&counts);
+                    }
+                    _ = expiry_shutdown.changed() => break,
+                }
+            }
+        });
 
         let accept_shared = shared.clone();
         let accept_task = tokio::spawn(async move {
@@ -138,6 +159,7 @@ impl Broker {
             shared,
             shutdown_tx,
             accept_task,
+            expiry_task,
         })
     }
 }
@@ -148,6 +170,7 @@ impl BrokerHandle {
     pub async fn shutdown(self) {
         let _ = self.shutdown_tx.send(true);
         let _ = self.accept_task.await;
+        let _ = self.expiry_task.await;
         let mut shared = self.shared;
         let inner = loop {
             match Arc::try_unwrap(shared) {
@@ -226,6 +249,14 @@ fn valid_topic_name(name: &str) -> bool {
 }
 
 impl Shared {
+    fn topic_partitions(&self, topic: &str) -> Option<u32> {
+        self.topics
+            .read()
+            .unwrap()
+            .get(topic)
+            .map(|ps| ps.len() as u32)
+    }
+
     fn partition(&self, topic: &str, partition: u32) -> Option<PartitionHandle> {
         self.topics
             .read()
@@ -416,7 +447,14 @@ fn dispatch(shared: &Arc<Shared>, req: Request, corr: u32, out: &UnboundedSender
             topic,
             partition,
             offset,
+            member_id,
+            generation,
         } => {
+            let fence = shared.groups.check_commit(&group, &member_id, generation);
+            if fence != ErrorCode::None {
+                respond(out, &Response::CommitOffset { error: fence }, corr);
+                return;
+            }
             let shared = shared.clone();
             let out = out.clone();
             tokio::spawn(async move {
@@ -441,6 +479,40 @@ fn dispatch(shared: &Arc<Shared>, req: Request, corr: u32, out: &UnboundedSender
                 },
                 corr,
             );
+        }
+        Request::JoinGroup {
+            group,
+            member_id,
+            session_timeout_ms,
+            topics,
+        } => {
+            let counts = |t: &str| shared.topic_partitions(t);
+            let outcome = shared
+                .groups
+                .join(&group, &member_id, session_timeout_ms, topics, &counts);
+            respond(
+                out,
+                &Response::JoinGroup {
+                    error: ErrorCode::None,
+                    member_id: outcome.member_id,
+                    generation: outcome.generation,
+                    assignment: outcome.assignment,
+                },
+                corr,
+            );
+        }
+        Request::Heartbeat {
+            group,
+            member_id,
+            generation,
+        } => {
+            let error = shared.groups.heartbeat(&group, &member_id, generation);
+            respond(out, &Response::Heartbeat { error }, corr);
+        }
+        Request::LeaveGroup { group, member_id } => {
+            let counts = |t: &str| shared.topic_partitions(t);
+            let error = shared.groups.leave(&group, &member_id, &counts);
+            respond(out, &Response::LeaveGroup { error }, corr);
         }
     }
 }
