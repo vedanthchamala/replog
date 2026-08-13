@@ -23,6 +23,28 @@ pub enum FsyncPolicy {
     Os,
 }
 
+impl FsyncPolicy {
+    /// Parses `always`, `os`, or `batch:<bytes>:<ms>` (the CLI/bench syntax).
+    pub fn parse(s: &str) -> std::result::Result<Self, String> {
+        match s {
+            "always" => Ok(FsyncPolicy::Always),
+            "os" => Ok(FsyncPolicy::Os),
+            _ => {
+                let rest = s
+                    .strip_prefix("batch:")
+                    .ok_or_else(|| format!("unknown fsync policy {s}"))?;
+                let (bytes, ms) = rest
+                    .split_once(':')
+                    .ok_or_else(|| format!("batch policy must be batch:<bytes>:<ms>, got {s}"))?;
+                Ok(FsyncPolicy::Batch {
+                    max_bytes: bytes.parse().map_err(|e| format!("batch bytes: {e}"))?,
+                    max_ms: ms.parse().map_err(|e| format!("batch ms: {e}"))?,
+                })
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct LogConfig {
     pub max_segment_bytes: u64,

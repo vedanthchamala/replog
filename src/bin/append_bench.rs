@@ -56,25 +56,6 @@ fn parse_args() -> Result<Args, String> {
     Ok(args)
 }
 
-fn parse_policy(s: &str) -> Result<FsyncPolicy, String> {
-    match s {
-        "always" => Ok(FsyncPolicy::Always),
-        "os" => Ok(FsyncPolicy::Os),
-        _ => {
-            let rest = s
-                .strip_prefix("batch:")
-                .ok_or_else(|| format!("unknown policy {s}"))?;
-            let (bytes, ms) = rest
-                .split_once(':')
-                .ok_or_else(|| format!("batch policy must be batch:<bytes>:<ms>, got {s}"))?;
-            Ok(FsyncPolicy::Batch {
-                max_bytes: bytes.parse().map_err(|e| format!("batch bytes: {e}"))?,
-                max_ms: ms.parse().map_err(|e| format!("batch ms: {e}"))?,
-            })
-        }
-    }
-}
-
 fn percentile(sorted: &[u64], q: f64) -> u64 {
     if sorted.is_empty() {
         return 0;
@@ -86,7 +67,7 @@ const HEADER: &str = "policy,records,value_bytes,elapsed_secs,appends_per_sec,mb
 p50_us,p99_us,p999_us,max_us,final_flush_ms";
 
 fn run(args: &Args) -> Result<String, String> {
-    let policy = parse_policy(&args.policy)?;
+    let policy = FsyncPolicy::parse(&args.policy)?;
     let config = LogConfig {
         fsync: policy,
         ..LogConfig::default()

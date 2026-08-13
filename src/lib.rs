@@ -4,4 +4,7 @@
 //! directory of segment files, records are CRC-protected, recovery truncates
 //! torn tails, and fsync policy is an explicit, measured choice.
 
+pub mod broker;
+pub mod client;
+pub mod proto;
 pub mod storage;
