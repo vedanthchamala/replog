@@ -17,26 +17,50 @@ fn parse_args() -> Result<(String, BrokerConfig), String> {
         max_bytes: 1024 * 1024,
         max_ms: 50,
     };
+    let mut broker_id = 0u32;
+    let mut controller_addr = None;
+    let mut advertise_addr = None;
+    let mut min_isr = 2u32;
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
         match flag.as_str() {
             "--listen" => listen = it.next().ok_or("--listen needs a value")?,
             "--data-dir" => data_dir = Some(it.next().ok_or("--data-dir needs a value")?),
             "--fsync" => fsync = FsyncPolicy::parse(&it.next().ok_or("--fsync needs a value")?)?,
+            "--broker-id" => {
+                broker_id = it
+                    .next()
+                    .ok_or("--broker-id needs a value")?
+                    .parse()
+                    .map_err(|e| format!("{e}"))?
+            }
+            "--controller-addr" => {
+                controller_addr = Some(it.next().ok_or("--controller-addr needs a value")?)
+            }
+            "--advertise-addr" => {
+                advertise_addr = Some(it.next().ok_or("--advertise-addr needs a value")?)
+            }
+            "--min-isr" => {
+                min_isr = it
+                    .next()
+                    .ok_or("--min-isr needs a value")?
+                    .parse()
+                    .map_err(|e| format!("{e}"))?
+            }
             other => return Err(format!("unknown flag {other}")),
         }
     }
     let data_dir = data_dir.ok_or("required: --data-dir <path>")?;
-    Ok((
-        listen,
-        BrokerConfig {
-            data_dir: data_dir.into(),
-            log: LogConfig {
-                fsync,
-                ..LogConfig::default()
-            },
-        },
-    ))
+    let log = LogConfig {
+        fsync,
+        ..LogConfig::default()
+    };
+    let mut config = BrokerConfig::standalone(data_dir, log);
+    config.broker_id = broker_id;
+    config.controller_addr = controller_addr;
+    config.advertise_addr = advertise_addr;
+    config.min_insync_replicas = min_isr;
+    Ok((listen, config))
 }
 
 #[tokio::main]

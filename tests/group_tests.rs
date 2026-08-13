@@ -17,16 +17,16 @@ use replog::storage::{FsyncPolicy, LogConfig};
 async fn start_broker(dir: &Path) -> BrokerHandle {
     Broker::start(
         "127.0.0.1:0",
-        BrokerConfig {
-            data_dir: dir.to_path_buf(),
-            log: LogConfig {
+        BrokerConfig::standalone(
+            dir,
+            LogConfig {
                 fsync: FsyncPolicy::Batch {
                     max_bytes: 64 * 1024,
                     max_ms: 5,
                 },
                 ..LogConfig::default()
             },
-        },
+        ),
     )
     .await
     .expect("broker start")

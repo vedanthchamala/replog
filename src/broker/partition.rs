@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{oneshot, watch};
 
 use crate::proto::{Acks, ErrorCode};
-use crate::storage::{FsyncPolicy, Log, LogConfig, Record, StorageError};
+use crate::storage::{EpochCheckpoint, FsyncPolicy, Log, LogConfig, Record, StorageError};
 
 pub struct ReadOk {
     pub log_start: u64,
@@ -38,6 +38,30 @@ pub enum Cmd {
         offset: u64,
         max_bytes: u64,
         reply: oneshot::Sender<Result<ReadOk, ErrorCode>>,
+    },
+    /// Follower path: append leader-fetched records verbatim. Replies with
+    /// the new log end.
+    AppendReplicated {
+        records: Vec<Record>,
+        reply: oneshot::Sender<Result<u64, ErrorCode>>,
+    },
+    /// Follower reconciliation: drop the divergent suffix so `offset`
+    /// becomes the next offset. Replies with the new log end.
+    TruncateTo {
+        offset: u64,
+        reply: oneshot::Sender<Result<u64, ErrorCode>>,
+    },
+    /// Leader transition: record (epoch, current log end) in the checkpoint.
+    /// Followers use it too, when they first observe a new epoch.
+    RecordEpoch { epoch: u64 },
+    /// (current epoch in checkpoint, log end)
+    EpochStatus {
+        reply: oneshot::Sender<(u64, u64)>,
+    },
+    /// Leader answering a follower: where did `epoch` end here?
+    EpochEndFor {
+        epoch: u64,
+        reply: oneshot::Sender<u64>,
     },
 }
 
@@ -101,6 +125,42 @@ impl PartitionHandle {
             .map_err(|_| ErrorCode::Storage)?;
         rx.await.unwrap_or(Err(ErrorCode::Storage))
     }
+
+    pub async fn append_replicated(&self, records: Vec<Record>) -> Result<u64, ErrorCode> {
+        let (tx, rx) = oneshot::channel();
+        self.tx
+            .send(Cmd::AppendReplicated { records, reply: tx })
+            .map_err(|_| ErrorCode::Storage)?;
+        rx.await.unwrap_or(Err(ErrorCode::Storage))
+    }
+
+    pub async fn truncate_to(&self, offset: u64) -> Result<u64, ErrorCode> {
+        let (tx, rx) = oneshot::channel();
+        self.tx
+            .send(Cmd::TruncateTo { offset, reply: tx })
+            .map_err(|_| ErrorCode::Storage)?;
+        rx.await.unwrap_or(Err(ErrorCode::Storage))
+    }
+
+    pub fn record_epoch(&self, epoch: u64) {
+        let _ = self.tx.send(Cmd::RecordEpoch { epoch });
+    }
+
+    pub async fn epoch_status(&self) -> Result<(u64, u64), ErrorCode> {
+        let (tx, rx) = oneshot::channel();
+        self.tx
+            .send(Cmd::EpochStatus { reply: tx })
+            .map_err(|_| ErrorCode::Storage)?;
+        rx.await.map_err(|_| ErrorCode::Storage)
+    }
+
+    pub async fn epoch_end_for(&self, epoch: u64) -> Result<u64, ErrorCode> {
+        let (tx, rx) = oneshot::channel();
+        self.tx
+            .send(Cmd::EpochEndFor { epoch, reply: tx })
+            .map_err(|_| ErrorCode::Storage)?;
+        rx.await.map_err(|_| ErrorCode::Storage)
+    }
 }
 
 pub fn spawn(
@@ -120,12 +180,13 @@ pub fn spawn(
         };
     }
     let log = Log::open(dir, log_config)?;
+    let epochs = EpochCheckpoint::load(dir)?;
     let (tx, rx) = mpsc::channel();
     let (watch_tx, watch_rx) = watch::channel(log.next_offset());
     let name = dir.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
     let join = std::thread::Builder::new()
         .name(format!("partition-{name}"))
-        .spawn(move || run(log, rx, watch_tx, config.fsync))
+        .spawn(move || run(log, epochs, rx, watch_tx, config.fsync))
         .expect("spawn partition thread");
     Ok((
         PartitionHandle {
@@ -156,7 +217,13 @@ fn map_storage_err(e: &StorageError) -> ErrorCode {
     }
 }
 
-fn run(mut log: Log, rx: Receiver<Cmd>, watch_tx: watch::Sender<u64>, policy: FsyncPolicy) {
+fn run(
+    mut log: Log,
+    mut epochs: EpochCheckpoint,
+    rx: Receiver<Cmd>,
+    watch_tx: watch::Sender<u64>,
+    policy: FsyncPolicy,
+) {
     let batch_max_ms = match policy {
         FsyncPolicy::Batch { max_ms, .. } => Some(max_ms),
         _ => None,
@@ -254,6 +321,56 @@ fn run(mut log: Log, rx: Receiver<Cmd>, watch_tx: watch::Sender<u64>, policy: Fs
                         map_storage_err(&e)
                     });
                 let _ = reply.send(result);
+            }
+            Ok(Cmd::AppendReplicated { records, reply }) => {
+                let mut result = Ok(log.next_offset());
+                for record in records {
+                    match log.append_replicated(record) {
+                        Ok(_) => {}
+                        Err(e) => {
+                            eprintln!("replicated append failed: {e}");
+                            result = Err(map_storage_err(&e));
+                            break;
+                        }
+                    }
+                }
+                if result.is_ok() {
+                    result = Ok(log.next_offset());
+                }
+                watch_tx.send_replace(log.next_offset());
+                dirty_since = if is_dirty(&log) {
+                    dirty_since.or_else(|| Some(Instant::now()))
+                } else {
+                    None
+                };
+                let _ = reply.send(result);
+            }
+            Ok(Cmd::TruncateTo { offset, reply }) => {
+                let result = log
+                    .truncate_suffix(offset)
+                    .and_then(|()| {
+                        epochs.truncate_to(offset)?;
+                        Ok(log.next_offset())
+                    })
+                    .map_err(|e| {
+                        eprintln!("truncate failed: {e}");
+                        map_storage_err(&e)
+                    });
+                watch_tx.send_replace(log.next_offset());
+                let _ = reply.send(result);
+            }
+            Ok(Cmd::RecordEpoch { epoch }) => {
+                if epoch > epochs.current_epoch()
+                    && let Err(e) = epochs.append(epoch, log.next_offset())
+                {
+                    eprintln!("epoch checkpoint append failed: {e}");
+                }
+            }
+            Ok(Cmd::EpochStatus { reply }) => {
+                let _ = reply.send((epochs.current_epoch(), log.next_offset()));
+            }
+            Ok(Cmd::EpochEndFor { epoch, reply }) => {
+                let _ = reply.send(epochs.end_offset_for(epoch, log.next_offset()));
             }
             Err(RecvTimeoutError::Timeout) => {
                 if let (Some(since), Some(ms)) = (dirty_since, batch_max_ms)

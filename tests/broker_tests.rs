@@ -13,16 +13,16 @@ use replog::proto::{Acks, ErrorCode, ProduceRecord};
 use replog::storage::{FsyncPolicy, LogConfig};
 
 fn test_config(dir: &Path) -> BrokerConfig {
-    BrokerConfig {
-        data_dir: dir.to_path_buf(),
-        log: LogConfig {
+    BrokerConfig::standalone(
+        dir,
+        LogConfig {
             fsync: FsyncPolicy::Batch {
                 max_bytes: 64 * 1024,
                 max_ms: 5,
             },
             ..LogConfig::default()
         },
-    }
+    )
 }
 
 async fn start_broker(dir: &Path) -> BrokerHandle {

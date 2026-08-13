@@ -7,19 +7,23 @@
 //! through one writer task per connection and may interleave out of request
 //! order — correlation IDs are what make that safe.
 
+mod cluster;
 mod groups;
 mod offsets;
 mod partition;
 
 pub use partition::PartitionHandle;
 
+use cluster::Replica;
 use groups::GroupCoordinator;
+
+use crate::client::Connection;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
@@ -49,6 +53,42 @@ pub enum BrokerError {
 pub struct BrokerConfig {
     pub data_dir: PathBuf,
     pub log: LogConfig,
+    pub broker_id: u32,
+    /// None = standalone (Stage 2/3 behavior: this broker is the world).
+    pub controller_addr: Option<String>,
+    /// Address other brokers/clients should dial; defaults to the bound one.
+    pub advertise_addr: Option<String>,
+    /// acks=all is refused when the ISR is smaller than this.
+    pub min_insync_replicas: u32,
+    /// A follower silent for this long is proposed out of the ISR.
+    pub replica_lag_ms: u64,
+}
+
+impl BrokerConfig {
+    pub fn standalone(data_dir: impl Into<PathBuf>, log: LogConfig) -> Self {
+        Self {
+            data_dir: data_dir.into(),
+            log,
+            broker_id: 0,
+            controller_addr: None,
+            advertise_addr: None,
+            min_insync_replicas: 2,
+            replica_lag_ms: 2000,
+        }
+    }
+
+    pub fn clustered(
+        data_dir: impl Into<PathBuf>,
+        log: LogConfig,
+        broker_id: u32,
+        controller_addr: impl Into<String>,
+    ) -> Self {
+        Self {
+            controller_addr: Some(controller_addr.into()),
+            broker_id,
+            ..Self::standalone(data_dir, log)
+        }
+    }
 }
 
 struct Shared {
@@ -58,6 +98,31 @@ struct Shared {
     offsets: OffsetsStore,
     groups: GroupCoordinator,
     threads: Mutex<Vec<std::thread::JoinHandle<()>>>,
+    // Cluster mode:
+    replicas: RwLock<HashMap<(String, u32), Arc<Replica>>>,
+    cluster_meta: RwLock<crate::proto::ClusterMeta>,
+    controller_conn: RwLock<Option<Connection>>,
+    refresh_tx: std::sync::OnceLock<tokio::sync::mpsc::UnboundedSender<()>>,
+}
+
+impl Shared {
+    fn is_clustered(&self) -> bool {
+        self.config.controller_addr.is_some()
+    }
+
+    fn replica(&self, topic: &str, partition: u32) -> Option<Arc<Replica>> {
+        self.replicas
+            .read()
+            .unwrap()
+            .get(&(topic.to_string(), partition))
+            .cloned()
+    }
+
+    fn ping_refresh(&self) {
+        if let Some(tx) = self.refresh_tx.get() {
+            let _ = tx.send(());
+        }
+    }
 }
 
 pub struct BrokerHandle {
@@ -66,6 +131,7 @@ pub struct BrokerHandle {
     shutdown_tx: watch::Sender<bool>,
     accept_task: JoinHandle<()>,
     expiry_task: JoinHandle<()>,
+    cluster_task: Option<JoinHandle<()>>,
 }
 
 pub struct Broker;
@@ -73,10 +139,17 @@ pub struct Broker;
 impl Broker {
     pub async fn start(listen: &str, config: BrokerConfig) -> Result<BrokerHandle, BrokerError> {
         std::fs::create_dir_all(&config.data_dir)?;
+        let clustered = config.controller_addr.is_some();
         let mut threads = Vec::new();
         let mut topics: HashMap<String, Vec<PartitionHandle>> = HashMap::new();
 
         for (topic, partitions) in scan_data_dir(&config.data_dir)? {
+            // In cluster mode data partitions are opened lazily as replica
+            // roles arrive from the controller; only the local offsets log is
+            // opened here.
+            if clustered && topic != OFFSETS_TOPIC {
+                continue;
+            }
             let mut handles = Vec::with_capacity(partitions as usize);
             for p in 0..partitions {
                 let dir = config.data_dir.join(format!("{topic}-{p}"));
@@ -114,8 +187,21 @@ impl Broker {
             offsets,
             groups: GroupCoordinator::new(),
             threads: Mutex::new(threads),
+            replicas: RwLock::new(HashMap::new()),
+            cluster_meta: RwLock::new(crate::proto::ClusterMeta::default()),
+            controller_conn: RwLock::new(None),
+            refresh_tx: std::sync::OnceLock::new(),
         });
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let cluster_task = if clustered {
+            Some(tokio::spawn(cluster_runtime(
+                shared.clone(),
+                shutdown_rx.clone(),
+            )))
+        } else {
+            None
+        };
 
         let expiry_shared = shared.clone();
         let mut expiry_shutdown = shutdown_rx.clone();
@@ -165,6 +251,7 @@ impl Broker {
             shutdown_tx,
             accept_task,
             expiry_task,
+            cluster_task,
         })
     }
 }
@@ -176,6 +263,11 @@ impl BrokerHandle {
         let _ = self.shutdown_tx.send(true);
         let _ = self.accept_task.await;
         let _ = self.expiry_task.await;
+        if let Some(task) = self.cluster_task {
+            let _ = task.await;
+        }
+        self.shared.replicas.write().unwrap().clear();
+        *self.shared.controller_conn.write().unwrap() = None;
         let mut shared = self.shared;
         let inner = loop {
             match Arc::try_unwrap(shared) {
@@ -255,6 +347,16 @@ fn valid_topic_name(name: &str) -> bool {
 
 impl Shared {
     fn topic_partitions(&self, topic: &str) -> Option<u32> {
+        if self.is_clustered() {
+            return self
+                .cluster_meta
+                .read()
+                .unwrap()
+                .topics
+                .iter()
+                .find(|t| t.name == topic)
+                .map(|t| t.partitions.len() as u32);
+        }
         self.topics
             .read()
             .unwrap()
@@ -329,6 +431,276 @@ impl Shared {
     }
 }
 
+/// Registers with the controller, heartbeats, and applies metadata changes
+/// (replica creation, role transitions, fetcher lifecycle, ISR proposals).
+async fn cluster_runtime(shared: Arc<Shared>, mut shutdown: watch::Receiver<bool>) {
+    let controller_addr = shared
+        .config
+        .controller_addr
+        .clone()
+        .expect("cluster runtime requires a controller address");
+    let (refresh_tx, mut refresh_rx) = unbounded_channel::<()>();
+    let _ = shared.refresh_tx.set(refresh_tx);
+    let mut local_version = 0u64;
+    let mut registered = false;
+    let mut tick = tokio::time::interval(Duration::from_millis(300));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        let forced = tokio::select! {
+            _ = tick.tick() => false,
+            _ = refresh_rx.recv() => true,
+            _ = shutdown.changed() => break,
+        };
+
+        let conn = {
+            let existing = shared.controller_conn.read().unwrap().clone();
+            match existing {
+                Some(c) => c,
+                None => match Connection::connect(&controller_addr).await {
+                    Ok(c) => {
+                        *shared.controller_conn.write().unwrap() = Some(c.clone());
+                        registered = false;
+                        c
+                    }
+                    Err(_) => continue,
+                },
+            }
+        };
+
+        if !registered {
+            let advertise = shared
+                .config
+                .advertise_addr
+                .clone()
+                .unwrap_or_else(|| shared.advertised.clone());
+            match conn
+                .call(&Request::RegisterBroker {
+                    broker_id: shared.config.broker_id,
+                    addr: advertise,
+                })
+                .await
+            {
+                Ok(Response::RegisterBroker {
+                    error: ErrorCode::None,
+                    ..
+                }) => registered = true,
+                _ => {
+                    *shared.controller_conn.write().unwrap() = None;
+                    continue;
+                }
+            }
+        }
+
+        let heartbeat = conn
+            .call(&Request::BrokerHeartbeat {
+                broker_id: shared.config.broker_id,
+                metadata_version: local_version,
+            })
+            .await;
+        let remote_version = match heartbeat {
+            Ok(Response::BrokerHeartbeat {
+                error: ErrorCode::None,
+                metadata_version,
+            }) => metadata_version,
+            Ok(Response::BrokerHeartbeat { .. }) => {
+                registered = false;
+                continue;
+            }
+            _ => {
+                *shared.controller_conn.write().unwrap() = None;
+                continue;
+            }
+        };
+
+        if remote_version != local_version || forced {
+            match conn.call(&Request::ControllerMetadata).await {
+                Ok(Response::ControllerMetadata {
+                    error: ErrorCode::None,
+                    cluster,
+                }) => {
+                    apply_metadata(&shared, &cluster).await;
+                    local_version = cluster.version;
+                    *shared.cluster_meta.write().unwrap() = cluster;
+                }
+                _ => {
+                    *shared.controller_conn.write().unwrap() = None;
+                    continue;
+                }
+            }
+        }
+
+        isr_maintenance(&shared, &conn).await;
+    }
+}
+
+async fn apply_metadata(shared: &Arc<Shared>, meta: &crate::proto::ClusterMeta) {
+    let self_id = shared.config.broker_id;
+    for topic in &meta.topics {
+        for p in &topic.partitions {
+            if !p.replicas.contains(&self_id) {
+                continue;
+            }
+            let key = (topic.name.clone(), p.partition);
+            let replica = match get_or_create_replica(shared, &key) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("replica open failed for {}-{}: {e}", key.0, key.1);
+                    continue;
+                }
+            };
+            let becoming_leader = p.leader == self_id as i32;
+            let mut failed_acks = Vec::new();
+            let (transition, generation) = {
+                let mut st = replica.state.lock().unwrap();
+                let unchanged = st.epoch == p.leader_epoch && st.is_leader == becoming_leader;
+                if unchanged {
+                    if st.isr != p.isr {
+                        st.isr = p.isr.clone();
+                    }
+                    // A follower whose fetcher died (leader connection lost)
+                    // needs a respawn even without a role change.
+                    if !st.is_leader && !st.fetcher_alive && p.leader >= 0 {
+                        st.fetcher_generation += 1;
+                        st.fetcher_alive = true;
+                        (true, st.fetcher_generation)
+                    } else {
+                        (false, st.fetcher_generation)
+                    }
+                } else {
+                    st.epoch = p.leader_epoch;
+                    st.replicas = p.replicas.clone();
+                    st.isr = p.isr.clone();
+                    st.is_leader = becoming_leader;
+                    st.fetcher_generation += 1;
+                    if becoming_leader {
+                        st.match_offsets.clear();
+                        st.leader_since = Instant::now();
+                        st.fetcher_alive = false;
+                    } else {
+                        failed_acks = std::mem::take(&mut st.pending_all);
+                        st.fetcher_alive = p.leader >= 0;
+                    }
+                    (true, st.fetcher_generation)
+                }
+            };
+            for (_, _, _, reply) in failed_acks {
+                let _ = reply.send(Err(ErrorCode::NotLeader));
+            }
+            if !transition {
+                replica.advance_hwm(self_id);
+                continue;
+            }
+            if becoming_leader {
+                replica.handle.record_epoch(p.leader_epoch);
+                replica.advance_hwm(self_id);
+            } else if p.leader >= 0 {
+                let leader_addr = meta
+                    .brokers
+                    .iter()
+                    .find(|(id, _)| *id == p.leader as u32)
+                    .map(|(_, addr)| addr.clone());
+                if let Some(addr) = leader_addr {
+                    let refresh = shared.refresh_tx.get().cloned();
+                    tokio::spawn(cluster::run_fetcher(
+                        replica.clone(),
+                        self_id,
+                        p.leader_epoch,
+                        generation,
+                        addr,
+                        refresh.expect("refresh channel set before apply"),
+                    ));
+                }
+            }
+        }
+    }
+}
+
+fn get_or_create_replica(
+    shared: &Arc<Shared>,
+    key: &(String, u32),
+) -> Result<Arc<Replica>, BrokerError> {
+    if let Some(r) = shared.replicas.read().unwrap().get(key) {
+        return Ok(r.clone());
+    }
+    let dir = shared.config.data_dir.join(format!("{}-{}", key.0, key.1));
+    let (handle, join) = partition::spawn(&dir, shared.config.log.clone())?;
+    shared.threads.lock().unwrap().push(join);
+    let replica = Replica::new(key.0.clone(), key.1, handle);
+    shared
+        .replicas
+        .write()
+        .unwrap()
+        .insert(key.clone(), replica.clone());
+    Ok(replica)
+}
+
+/// Leader-side ISR upkeep: propose shrinking out silent followers and
+/// re-adding caught-up ones. The controller owns the decision.
+async fn isr_maintenance(shared: &Arc<Shared>, conn: &Connection) {
+    let self_id = shared.config.broker_id;
+    let lag = Duration::from_millis(shared.config.replica_lag_ms);
+    let replicas: Vec<Arc<Replica>> = shared.replicas.read().unwrap().values().cloned().collect();
+    for replica in replicas {
+        let log_end = *replica.handle.next_offset.borrow();
+        let proposal = {
+            let st = replica.state.lock().unwrap();
+            if !st.is_leader {
+                continue;
+            }
+            let now = Instant::now();
+            let mut desired: Vec<u32> = vec![self_id];
+            for follower in st.replicas.iter().filter(|id| **id != self_id) {
+                let (matched, last_fetch) = st
+                    .match_offsets
+                    .get(follower)
+                    .copied()
+                    .unwrap_or((0, st.leader_since));
+                let in_isr = st.isr.contains(follower);
+                let fresh = now.duration_since(last_fetch) <= lag;
+                let caught_up = matched >= log_end;
+                if (in_isr && fresh) || caught_up {
+                    desired.push(*follower);
+                }
+            }
+            desired.sort_unstable();
+            let mut current = st.isr.clone();
+            current.sort_unstable();
+            if desired == current {
+                None
+            } else {
+                Some((st.epoch, desired))
+            }
+        };
+        let Some((epoch, desired)) = proposal else {
+            continue;
+        };
+        match conn
+            .call(&Request::AlterIsr {
+                topic: replica.topic.clone(),
+                partition: replica.partition,
+                leader_epoch: epoch,
+                isr: desired.clone(),
+            })
+            .await
+        {
+            Ok(Response::AlterIsr {
+                error: ErrorCode::None,
+                ..
+            }) => {
+                {
+                    let mut st = replica.state.lock().unwrap();
+                    if st.is_leader && st.epoch == epoch {
+                        st.isr = desired;
+                    }
+                }
+                replica.advance_hwm(self_id);
+            }
+            Ok(Response::AlterIsr { .. }) => shared.ping_refresh(),
+            _ => {}
+        }
+    }
+}
+
 async fn serve_connection(
     shared: Arc<Shared>,
     stream: TcpStream,
@@ -386,8 +758,35 @@ fn dispatch(shared: &Arc<Shared>, req: Request, corr: u32, out: &UnboundedSender
             partitions,
             replication_factor,
         } => {
-            // Standalone broker cannot host replicas; a cluster routes topic
-            // creation through the controller instead.
+            if shared.is_clustered() {
+                let shared = shared.clone();
+                let out = out.clone();
+                tokio::spawn(async move {
+                    let conn = shared.controller_conn.read().unwrap().clone();
+                    let resp = match conn {
+                        None => Response::CreateTopic {
+                            error: ErrorCode::Storage,
+                        },
+                        Some(conn) => match conn
+                            .call(&Request::CreateTopic {
+                                topic,
+                                partitions,
+                                replication_factor,
+                            })
+                            .await
+                        {
+                            Ok(resp @ Response::CreateTopic { .. }) => resp,
+                            _ => Response::CreateTopic {
+                                error: ErrorCode::Storage,
+                            },
+                        },
+                    };
+                    shared.ping_refresh();
+                    respond(&out, &resp, corr);
+                });
+                return;
+            }
+            // Standalone broker cannot host replicas.
             let error = if replication_factor > 1 {
                 ErrorCode::Malformed
             } else {
@@ -396,11 +795,16 @@ fn dispatch(shared: &Arc<Shared>, req: Request, corr: u32, out: &UnboundedSender
             respond(out, &Response::CreateTopic { error }, corr);
         }
         Request::Metadata => {
+            let cluster = if shared.is_clustered() {
+                shared.cluster_meta.read().unwrap().clone()
+            } else {
+                shared.metadata()
+            };
             respond(
                 out,
                 &Response::Metadata {
                     error: ErrorCode::None,
-                    cluster: shared.metadata(),
+                    cluster,
                 },
                 corr,
             );
@@ -412,17 +816,121 @@ fn dispatch(shared: &Arc<Shared>, req: Request, corr: u32, out: &UnboundedSender
             leader_epoch,
             records,
         } => {
+            let produce_error = |error| Response::Produce {
+                error,
+                base_offset: 0,
+                count: 0,
+            };
+            if shared.is_clustered() {
+                let Some(replica) = shared.replica(&topic, partition) else {
+                    if acks != Acks::None {
+                        let known = shared
+                            .cluster_meta
+                            .read()
+                            .unwrap()
+                            .topics
+                            .iter()
+                            .any(|t| t.name == topic);
+                        let code = if known {
+                            ErrorCode::NotLeader
+                        } else {
+                            ErrorCode::UnknownTopicOrPartition
+                        };
+                        respond(out, &produce_error(code), corr);
+                    }
+                    return;
+                };
+                let (is_leader, epoch, isr_len) = {
+                    let st = replica.state.lock().unwrap();
+                    (st.is_leader, st.epoch, st.isr.len())
+                };
+                let precheck = if !is_leader {
+                    Some(ErrorCode::NotLeader)
+                } else if leader_epoch != 0 && leader_epoch != epoch {
+                    Some(ErrorCode::FencedEpoch)
+                } else if acks == Acks::All
+                    && (isr_len as u32) < shared.config.min_insync_replicas
+                {
+                    Some(ErrorCode::NotEnoughReplicas)
+                } else {
+                    None
+                };
+                if let Some(code) = precheck {
+                    if acks != Acks::None {
+                        respond(out, &produce_error(code), corr);
+                    }
+                    return;
+                }
+                let records: Vec<_> = records.into_iter().map(|r| (r.key, r.value)).collect();
+                if acks == Acks::None {
+                    replica.handle.append_no_reply(records);
+                    return;
+                }
+                if acks != Acks::All {
+                    let reply = replica.handle.append_start(records, acks);
+                    let out = out.clone();
+                    tokio::spawn(async move {
+                        let resp = match reply.await.unwrap_or(Err(ErrorCode::Storage)) {
+                            Ok((base_offset, count)) => Response::Produce {
+                                error: ErrorCode::None,
+                                base_offset,
+                                count,
+                            },
+                            Err(error) => produce_error(error),
+                        };
+                        respond(&out, &resp, corr);
+                    });
+                    return;
+                }
+                // acks=all: append now (order preserved), ack when the HWM
+                // covers the batch — i.e. every ISR member has it.
+                let reply = replica.handle.append_start(records, Acks::Written);
+                let out = out.clone();
+                let self_id = shared.config.broker_id;
+                tokio::spawn(async move {
+                    let (base, count) = match reply.await.unwrap_or(Err(ErrorCode::Storage)) {
+                        Ok(ok) => ok,
+                        Err(error) => {
+                            respond(&out, &produce_error(error), corr);
+                            return;
+                        }
+                    };
+                    if count == 0 {
+                        respond(
+                            &out,
+                            &Response::Produce {
+                                error: ErrorCode::None,
+                                base_offset: base,
+                                count,
+                            },
+                            corr,
+                        );
+                        return;
+                    }
+                    let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+                    {
+                        let mut st = replica.state.lock().unwrap();
+                        st.pending_all.push((base + count as u64 - 1, base, count, ack_tx));
+                    }
+                    replica.advance_hwm(self_id);
+                    let resp = match tokio::time::timeout(Duration::from_secs(15), ack_rx).await
+                    {
+                        Ok(Ok(Ok((base_offset, count)))) => Response::Produce {
+                            error: ErrorCode::None,
+                            base_offset,
+                            count,
+                        },
+                        Ok(Ok(Err(error))) => produce_error(error),
+                        // Dropped or timed out: replication never covered it.
+                        _ => produce_error(ErrorCode::NotEnoughReplicas),
+                    };
+                    respond(&out, &resp, corr);
+                });
+                return;
+            }
             if leader_epoch != 0 {
                 if acks != Acks::None {
-                    respond(
-                        out,
-                        &Response::Produce {
-                            error: ErrorCode::FencedEpoch,
-                            base_offset: 0,
-                            count: 0,
-                        },
-                        corr,
-                    );
+                    respond(out, &produce_error(ErrorCode::FencedEpoch), corr);
                 }
                 return;
             }
@@ -470,17 +978,30 @@ fn dispatch(shared: &Arc<Shared>, req: Request, corr: u32, out: &UnboundedSender
             max_bytes,
             max_wait_ms,
         } => {
+            let fetch_error = |error| Response::Fetch {
+                error,
+                log_start: 0,
+                next_offset: 0,
+                records: Vec::new(),
+            };
+            if shared.is_clustered() {
+                let Some(replica) = shared.replica(&topic, partition) else {
+                    respond(out, &fetch_error(ErrorCode::NotLeader), corr);
+                    return;
+                };
+                if !replica.state.lock().unwrap().is_leader {
+                    respond(out, &fetch_error(ErrorCode::NotLeader), corr);
+                    return;
+                }
+                let out = out.clone();
+                tokio::spawn(async move {
+                    let resp = handle_fetch_hwm(replica, offset, max_bytes, max_wait_ms).await;
+                    respond(&out, &resp, corr);
+                });
+                return;
+            }
             let Some(handle) = shared.partition(&topic, partition) else {
-                respond(
-                    out,
-                    &Response::Fetch {
-                        error: ErrorCode::UnknownTopicOrPartition,
-                        log_start: 0,
-                        next_offset: 0,
-                        records: Vec::new(),
-                    },
-                    corr,
-                );
+                respond(out, &fetch_error(ErrorCode::UnknownTopicOrPartition), corr);
                 return;
             };
             let out = out.clone();
@@ -561,29 +1082,94 @@ fn dispatch(shared: &Arc<Shared>, req: Request, corr: u32, out: &UnboundedSender
             let error = shared.groups.leave(&group, &member_id, &counts);
             respond(out, &Response::LeaveGroup { error }, corr);
         }
-        // Replication traffic reaches a standalone broker only by mistake.
-        Request::ReplicaFetch { .. } => {
-            respond(
-                out,
-                &Response::ReplicaFetch {
-                    error: ErrorCode::NotLeader,
-                    leader_epoch: 0,
-                    log_end: 0,
-                    high_watermark: 0,
-                    records: Vec::new(),
-                },
-                corr,
-            );
+        Request::ReplicaFetch {
+            topic,
+            partition,
+            follower_id,
+            leader_epoch,
+            offset,
+            max_bytes,
+            max_wait_ms,
+        } => {
+            let replica_error = |error| Response::ReplicaFetch {
+                error,
+                leader_epoch: 0,
+                log_end: 0,
+                high_watermark: 0,
+                records: Vec::new(),
+            };
+            let Some(replica) = shared.replica(&topic, partition) else {
+                respond(out, &replica_error(ErrorCode::NotLeader), corr);
+                return;
+            };
+            let accepted = {
+                let mut st = replica.state.lock().unwrap();
+                if !st.is_leader {
+                    Some(ErrorCode::NotLeader)
+                } else if leader_epoch != st.epoch {
+                    Some(ErrorCode::FencedEpoch)
+                } else {
+                    // A fetch at `offset` proves the follower has everything
+                    // before it — that is the replication progress signal.
+                    st.match_offsets.insert(follower_id, (offset, Instant::now()));
+                    None
+                }
+            };
+            if let Some(code) = accepted {
+                respond(out, &replica_error(code), corr);
+                return;
+            }
+            let self_id = shared.config.broker_id;
+            replica.advance_hwm(self_id);
+            let out = out.clone();
+            tokio::spawn(async move {
+                let resp =
+                    handle_replica_fetch(replica, leader_epoch, offset, max_bytes, max_wait_ms)
+                        .await;
+                respond(&out, &resp, corr);
+            });
         }
-        Request::EpochCheck { .. } => {
-            respond(
-                out,
-                &Response::EpochCheck {
-                    error: ErrorCode::NotLeader,
-                    end_offset: 0,
-                },
-                corr,
-            );
+        Request::EpochCheck {
+            topic,
+            partition,
+            epoch,
+        } => {
+            let Some(replica) = shared.replica(&topic, partition) else {
+                respond(
+                    out,
+                    &Response::EpochCheck {
+                        error: ErrorCode::NotLeader,
+                        end_offset: 0,
+                    },
+                    corr,
+                );
+                return;
+            };
+            if !replica.state.lock().unwrap().is_leader {
+                respond(
+                    out,
+                    &Response::EpochCheck {
+                        error: ErrorCode::NotLeader,
+                        end_offset: 0,
+                    },
+                    corr,
+                );
+                return;
+            }
+            let out = out.clone();
+            tokio::spawn(async move {
+                let resp = match replica.handle.epoch_end_for(epoch).await {
+                    Ok(end_offset) => Response::EpochCheck {
+                        error: ErrorCode::None,
+                        end_offset,
+                    },
+                    Err(error) => Response::EpochCheck {
+                        error,
+                        end_offset: 0,
+                    },
+                };
+                respond(&out, &resp, corr);
+            });
         }
         // Controller-plane messages belong to the controller process.
         Request::RegisterBroker { .. } => {
@@ -670,6 +1256,130 @@ async fn handle_fetch(
             error,
             log_start: 0,
             next_offset: 0,
+            records: Vec::new(),
+        },
+    }
+}
+
+/// Consumer fetch on a replicated partition: bounded by the high-water mark.
+/// Records past the HWM exist but are not yet replication-committed; handing
+/// them out would let a consumer see data a failover can erase.
+async fn handle_fetch_hwm(
+    replica: Arc<Replica>,
+    offset: u64,
+    max_bytes: u32,
+    max_wait_ms: u32,
+) -> Response {
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(max_wait_ms as u64);
+    let mut hwm_rx = replica.hwm_rx.clone();
+    loop {
+        let hwm = *hwm_rx.borrow();
+        let log_end = *replica.handle.next_offset.borrow();
+        if offset > log_end {
+            return Response::Fetch {
+                error: ErrorCode::OffsetOutOfRange,
+                log_start: 0,
+                next_offset: hwm,
+                records: Vec::new(),
+            };
+        }
+        if offset < hwm {
+            match replica.handle.read(offset, max_bytes as u64).await {
+                Ok(ok) => {
+                    let mut records: Vec<FetchedRecord> = ok
+                        .records
+                        .into_iter()
+                        .take_while(|r| r.offset < hwm)
+                        .map(|r| FetchedRecord {
+                            offset: r.offset,
+                            timestamp_ms: r.timestamp_ms,
+                            key: r.key,
+                            value: r.value,
+                        })
+                        .collect();
+                    if records.is_empty() {
+                        // Between our HWM read and the log read the log
+                        // truncated or raced; report empty rather than spin.
+                        records = Vec::new();
+                    }
+                    return Response::Fetch {
+                        error: ErrorCode::None,
+                        log_start: ok.log_start,
+                        next_offset: hwm,
+                        records,
+                    };
+                }
+                Err(error) => {
+                    return Response::Fetch {
+                        error,
+                        log_start: 0,
+                        next_offset: hwm,
+                        records: Vec::new(),
+                    };
+                }
+            }
+        }
+        let woke = tokio::time::timeout_at(deadline, hwm_rx.wait_for(|&h| h > offset)).await;
+        match woke {
+            Ok(Ok(_)) => continue,
+            _ => {
+                return Response::Fetch {
+                    error: ErrorCode::None,
+                    log_start: 0,
+                    next_offset: *replica.hwm_rx.borrow(),
+                    records: Vec::new(),
+                };
+            }
+        }
+    }
+}
+
+/// Follower fetch: reads to the log end (past the HWM — replication is how
+/// records BECOME committed), long-polling on the log end watch.
+async fn handle_replica_fetch(
+    replica: Arc<Replica>,
+    leader_epoch: u64,
+    offset: u64,
+    max_bytes: u32,
+    max_wait_ms: u32,
+) -> Response {
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(max_wait_ms as u64);
+    let mut next_offset = replica.handle.next_offset.clone();
+    let result = loop {
+        match replica.handle.read(offset, max_bytes as u64).await {
+            Ok(ok) if ok.records.is_empty() && tokio::time::Instant::now() < deadline => {
+                let woke =
+                    tokio::time::timeout_at(deadline, next_offset.wait_for(|&n| n > offset)).await;
+                match woke {
+                    Ok(Ok(_)) => continue,
+                    _ => break Ok(ok),
+                }
+            }
+            other => break other,
+        }
+    };
+    match result {
+        Ok(ok) => Response::ReplicaFetch {
+            error: ErrorCode::None,
+            leader_epoch,
+            log_end: ok.next_offset,
+            high_watermark: *replica.hwm_rx.borrow(),
+            records: ok
+                .records
+                .into_iter()
+                .map(|r| FetchedRecord {
+                    offset: r.offset,
+                    timestamp_ms: r.timestamp_ms,
+                    key: r.key,
+                    value: r.value,
+                })
+                .collect(),
+        },
+        Err(error) => Response::ReplicaFetch {
+            error,
+            leader_epoch,
+            log_end: 0,
+            high_watermark: 0,
             records: Vec::new(),
         },
     }
