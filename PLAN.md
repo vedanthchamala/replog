@@ -6,7 +6,7 @@ shouldn't over-constrain what the working system teaches us.
 
 ---
 
-## Stage 1 (ACTIVE) — single-node storage engine
+## Stage 1 (DONE 2026-08-13) — single-node storage engine
 
 The disk layer everything else sits on. No network, no threads beyond tests. The whole
 stage is synchronous Rust: a `Log` you can `append()` to and `read()` from that survives
@@ -117,19 +117,107 @@ group commit buys back.
 
 ---
 
-## Stage 2 (skeleton) — TCP broker + clients
+## Stage 2 (ACTIVE) — TCP broker + clients
 
-- tokio; length-prefixed frames (u32 len + u16 msg type + body); hand-rolled encoding
-  shared by client and broker (one `proto` module, round-trip property tests).
-- Requests: Produce (topic, partition, records, acks), Fetch (topic, partition, offset,
-  max_bytes, max_wait — long-poll), CommitOffset / FetchOffset (group, topic, partition),
-  Metadata. Correlation IDs for pipelining.
-- Broker: one async task per connection; per-partition writer task owning the `Log`
-  (single-writer principle — same reasoning as nanoserve's engine thread); ack held
-  until covering flush under Batch policy.
-- Consumer offsets stored in an internal `__offsets` log (dogfooding the log as its own
-  metadata store, like Kafka).
-- Bench: throughput vs producer batch size; latency percentiles at fixed arrival rate.
+tokio broker + hand-rolled binary protocol + producer/consumer clients. The stage's
+point: the ack contract (when is a produce "accepted"?) becomes real — under group
+commit, acks are *held until the covering flush*, which is what makes Batch a safe
+policy rather than a lie. Single broker, no replication yet; topics have partitions
+but consumer *groups* wait for Stage 3.
+
+### Wire protocol (`src/proto/`)
+
+Frame (little-endian, both directions):
+
+```
+u32  len         length of everything after this field
+u8   version     protocol version (1)
+u8   msg_type
+u32  correlation_id
+     body        per message type
+```
+
+Correlation IDs are chosen by the client and echoed by the broker; responses may
+arrive out of order (long-poll fetches), which is what makes pipelining safe.
+Primitives: strings = u16 len + UTF-8; bytes = u32 len; optional bytes = i32 len
+with -1 = null (same convention as the record format). Max frame 32 MiB.
+
+Requests / responses (msg_type = request, response = request | 0x80):
+
+| type | request body | response body |
+|---|---|---|
+| 1 CreateTopic | topic, u32 partitions | u16 error |
+| 2 Metadata | — | u16 error, topics: [(topic, u32 partitions)] |
+| 3 Produce | topic, u32 partition, u8 acks, records: [(key?, value)] | u16 error, u64 base_offset, u32 count (no response at all for acks=0) |
+| 4 Fetch | topic, u32 partition, u64 offset, u32 max_bytes, u32 max_wait_ms | u16 error, u64 log_start, u64 next_offset, records: [(u64 offset, i64 ts, key?, value)] |
+| 5 CommitOffset | group, topic, u32 partition, u64 offset | u16 error |
+| 6 FetchOffset | group, topic, u32 partition | u16 error, i64 offset (-1 = none) |
+
+`acks`: 0 = fire-and-forget (no response frame, Kafka-style), 1 = written (in the
+log, page cache), 2 = durable (covering flush completed). With one broker, 2 is the
+strongest contract available; at Stage 4 “all” layers replication on top of it.
+
+Error codes (u16): 0 ok, 1 unknown topic/partition, 2 offset out of range,
+3 storage error, 4 malformed request, 5 topic exists.
+
+### Broker (`src/broker/`)
+
+- `src/bin/replog_broker.rs`: `--listen addr --data-dir path --fsync always|os|batch:<bytes>:<ms>`.
+- One tokio task per connection: decode frame → dispatch → write response frames
+  (writes serialized through a per-connection mpsc so pipelined responses interleave
+  cleanly).
+- **One writer task per partition owning its `Log`** (single-writer principle).
+  Commands arrive on an mpsc channel; appends reply via oneshot.
+- **Ack ledger:** for acks=durable under Batch, the partition task parks the reply
+  in a pending list keyed by last offset; every flush drains entries ≤ durable_offset.
+  A tokio timer fires the time-based flush (`max_ms`) so a lone record's ack is never
+  stranded (Stage 1's Log only flushes inside append calls; the broker owns time).
+- **Long-poll fetch:** each partition task publishes `next_offset` on a
+  `tokio::sync::watch`; a fetch at the log end subscribes and waits (bounded by
+  `max_wait_ms`) instead of busy-polling.
+- Reads go through the partition task too (actor model) — serializing reads with
+  writes per partition is the simple correct baseline; measure before optimizing.
+- **Offsets store:** internal `__offsets` topic (1 partition), dogfooding the log:
+  commit = append of (group|topic|partition → offset) record; broker replays it into
+  a HashMap at startup. Compaction is deliberately absent (Stage 6 stretch).
+- Topics = directories `<data-dir>/<topic>-<partition>/`; partition count inferred
+  at startup, CreateTopic makes the dirs. (Controller owns metadata at Stage 4.)
+
+### Clients (`src/client/`)
+
+- `Connection`: framed TCP + correlation-id routing table (background read task →
+  oneshot per in-flight request) — pipelining for free.
+- `Producer`: buffers (key, value) pairs; flushes as one Produce when `batch_records`
+  is reached or on explicit `flush()`; configurable `acks`. Returns base offsets.
+- `Consumer`: `poll()` fetch loop tracking position; `commit()`/resume via
+  CommitOffset/FetchOffset with a group name (name only — real group membership is
+  Stage 3).
+
+### Tests (pass conditions in executable form)
+
+1. proto round-trips: every message type encode→decode identity, plus truncated-buffer
+   and garbage-header rejection (unit tests in `proto`).
+2. e2e in-process: create topic → produce 10k mixed records (null keys, big values)
+   in batches → fetch all → byte-identical, offsets contiguous.
+3. Long-poll: fetch at log end parks; a produce during the wait completes it early
+   with the new records.
+4. **Crash durability across the ack boundary:** broker as a child *process*
+   (`CARGO_BIN_EXE_replog_broker`), produce with acks=durable, `kill -9`, restart on
+   the same data dir → every acked record is fetchable. (The Stage-2 version of the
+   SPEC's durability contract.)
+5. Consumer resume: produce 100, consume 60, commit, restart broker, new consumer
+   with the same group resumes at 60.
+6. Pipelining: N produces sent before any response is awaited; all responses arrive
+   and match their correlation IDs.
+
+### Bench (end of stage)
+
+`src/bin/broker_bench.rs` + `bench/run_broker_bench.sh` → CSV + plot:
+- Throughput vs producer batch size (1/10/100/1000 records per Produce) at
+  acks=written and acks=durable (batch fsync), 100 B values, localhost.
+- Produce round-trip latency percentiles (p50/p99) per batch size.
+Headline: what client-side batching buys over TCP, and what the durable-ack
+contract costs vs written-ack.
 
 ## Stage 3 (skeleton) — partitions + consumer groups
 
