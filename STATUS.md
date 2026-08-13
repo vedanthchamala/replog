@@ -3,7 +3,7 @@
 > Session pickup file. Read SPEC.md → PLAN.md → this file → LOG.md (latest entry) at
 > the start of every session, before touching code.
 
-**Stage:** 2 complete → 3 (partitions + consumer groups) next
+**Stage:** 3 complete → 4 (replication + failover) next
 **Last updated:** 2026-08-13
 
 ## Done
@@ -11,29 +11,33 @@
 - Rust toolchain installed (rustup stable, minimal profile).
 - Repo initialized, public on GitHub (`vedanthchamala/replog`).
 - SPEC.md (guarantees, non-goals, stage plan), PLAN.md (per-stage detail).
-- **Stage 1 COMPLETE** — storage engine (CRC'd records, sparse indexes, segment
-  roll, torn-tail recovery, fsync policies with F_FULLFSYNC on macOS), 8/8 tests
-  green, and the fsync-policy curve measured + plotted (`bench/results/`):
-  always 238 appends/s vs batch 550k vs os 955k at 100 B values.
+- **Stage 1 COMPLETE** — storage engine (CRC'd records, sparse indexes, torn-tail
+  recovery, fsync policies with F_FULLFSYNC), 8 tests, fsync curve measured:
+  always 238 vs batch 550k vs os 955k appends/s at 100 B.
 - **Stage 2 COMPLETE** — wire protocol (frames, correlation IDs), tokio broker
-  (per-partition writer threads, durable acks held until covering flush, long-poll
-  fetch, `__offsets` log), pipelined clients. 18 tests green incl. `kill -9` of a
-  real broker process with zero durable-acked loss. Bench: batch curve 21.8k→553k
-  rec/s written / 91→56k durable; pipelining to ~646k; open-loop percentiles.
-  War story: the double-fsync (two timers, one flush) — LOG 2026-08-13.
+  (partition writer threads, durable acks held until covering flush, long-poll,
+  `__offsets`), pipelined clients. `kill -9` durability test. Batch curve 21.8k→553k
+  written / 91→57k durable rec/s. War story: the double-fsync (LOG 2026-08-13).
+- **Stage 2 milestone PDF** — `interview/replog_guide.tex` compiles (7 pages).
+- **Stage 3 COMPLETE** — key-hash partitioning, broker-side group coordinator
+  (generations, range assignment, eviction sweep), fenced commits, GroupConsumer,
+  checker v1. Eval: consumer crash → rebalance, 3000/3000 delivered, 400 dups
+  counted, takeover 1.16 s. Fan-out findings: durable+pipelining ≈ written (590k);
+  per-partition fsync fragments group commit (590k→211k at 8 partitions);
+  single-machine ceiling ~600k rec/s is the machine. 28 tests green.
 
 ## In progress
 
-- Interview PDF first compile (Stage 2 milestone).
+- (nothing — Stage 4 planning is next)
 
 ## Next actions (in order)
 
-1. interview/replog_guide.tex: compile NOTES.md material with pdflatex.
-2. PLAN.md: detail Stage 3 (key-hash partitioning, group coordinator,
-   join/leave/heartbeat, generation fencing, rebalance, checker v1).
-3. Build Stage 3 + its evals (2 consumers split partitions; kill one → rebalance;
-   at-least-once delivery verified by checker).
-4. Stage 3 milestone: LOG entry + STATUS + PDF refresh + push.
+1. PLAN.md: detail Stage 4 (controller, follower fetch, ISR tracking, HWM,
+   acks=all, min-ISR, leader epochs, failover demo + measurements).
+2. Build Stage 4 + evals (kill -9 leader under load at acks=all → zero acked
+   loss, checker-verified; stale-leader rejoin truncates via epoch).
+3. Stage 4 milestone: LOG + STATUS + NOTES + PDF refresh + push.
+4. Stage 5: torture harness (seeded fault schedules, offline checker).
 
 ## Standing rules for any session (any model)
 

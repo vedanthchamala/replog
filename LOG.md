@@ -142,3 +142,49 @@ latency percentiles at fixed rate ✅ (open-loop mode). Stage 2 closed.
 
 **Next:** interview PDF first compile (Stage 2 milestone), then Stage 3 planning
 (partitions + consumer groups + rebalance + checker v1).
+
+---
+
+## 2026-08-13 (later) — interview PDF milestone + Stage 3 COMPLETE
+
+**PDF:** first pdflatex compile of `interview/replog_guide.tex` (7 pages) from
+NOTES.md material — pitch, decision log, war stories, numbers, glossary, Q&A,
+honesty box. (Private, git-ignored, as always.)
+
+**Built (Stage 3):** JoinGroup/Heartbeat/LeaveGroup protocol + generation-fenced
+CommitOffset; broker-side group coordinator (range assignment, generation bump
+per membership change, 200 ms eviction sweep); `TopicProducer` (crc32 key-hash
+routing, per-partition batches); `GroupConsumer` (poll-driven heartbeats,
+auto-rejoin, fenced commits); **checker v1** as a library — at-least-once,
+duplicate accounting, per-generation offset monotonicity, same-offset⇒same-id.
+28 tests green.
+
+**Checker taught us the contract:** first draft flagged post-rebalance rewind to
+the committed offset as a monotonicity violation — but that rewind IS
+at-least-once redelivery. Rule corrected to "monotonic within one assignment
+generation." Writing checkers forces the contract to get precise.
+
+**The stage eval** (SPEC pass condition): 4 partitions, 3000 keyed records,
+2 group consumers, consumer B crashes (no Leave) mid-stream → evicted at session
+timeout → A absorbs all partitions. Checker: 3000/3000 acked ids consumed,
+**zero at-least-once violations**, 400 duplicates counted honestly, takeover
+1.16 s after crash (decomposes exactly into 1 s session timeout + sweep +
+heartbeat interval). `cargo test --test group_tests rebalance_preserves`.
+
+**Measured (partition fan-out, one broker):** three findings that matter:
+(1) durable + pipelining ≈ written — 57k → 590k rec/s at inflight 8, one
+partition: eight batches share each barrier, so the durable/written gap is the
+price of *waiting alone*, not of durability. (2) More partitions made durable
+throughput WORSE on one disk (590k → 211k at 8 partitions): per-partition
+writers fragment group commit into N serialized device barriers. (3) The
+~600k rec/s written ceiling is the *machine*, not a component — proven by
+conn-per-partition (no change) and two concurrent client processes (they split
+the same total, 273k+273k). Partition scaling is a cross-machine story;
+measured properly at Stage 4.
+
+**Stage 3 exit review vs SPEC:** 2 consumers split N partitions ✅ · kill one →
+rebalance ✅ (session-timeout eviction, takeover measured) · every record
+delivered ≥ once, verified by checker ✅. Stage 3 closed.
+
+**Next:** Stage 4 planning (replication: controller, follower fetch, ISR,
+acks=all, leader epochs, failover) — the project's centerpiece.

@@ -8,9 +8,11 @@ replication with ISR tracking and leader-epoch fencing — and a fault-injection
 harness whose checker proves the durability contract (`kill -9` the leader,
 zero acknowledged writes lost) from client-observed histories.
 
-**Status:** Stages 1–2 of 6 complete — storage engine + TCP broker/clients; next
-is Stage 3 (partitioning + consumer groups). See [SPEC.md](SPEC.md) for guarantees
-and the stage plan, [PLAN.md](PLAN.md) for the active stage in detail,
+**Status:** Stages 1–3 of 6 complete — storage engine, TCP broker/clients, and
+partitioning + consumer groups (crash-triggered rebalance verified by a history
+checker: 3000/3000 acked records delivered, duplicates counted, zero contract
+violations). Next: Stage 4, replication + failover. See [SPEC.md](SPEC.md) for
+guarantees and the stage plan, [PLAN.md](PLAN.md) for the active stage in detail,
 [LOG.md](LOG.md) for the dated build log.
 
 Built as a study of why real distributed logs are designed the way they are: every
@@ -44,7 +46,16 @@ The Stage 2 broker curve (one broker, one partition, localhost, 100 B values;
 Same amortization story one layer up: client batching splits the per-request cost
 (and, at acks=durable, the group-commit barrier) across the batch. A `kill -9`
 integration test verifies that every durable-acked record survives crash + restart
-of a real broker process. Details, plots, CSVs: [`bench/results/`](bench/results/).
+of a real broker process.
+
+Three Stage 3 findings worth the click ([`bench/results/`](bench/results/)):
+pipelining 8 produce batches makes durable acks nearly free (57k → 590k rec/s,
+within ~5% of written — batches share the barrier); spreading one stream over
+more partitions makes durable throughput *worse* on one disk (590k → 211k at 8
+partitions — per-partition fsync fragments group commit into serialized device
+barriers); and the ~600k rec/s single-machine ceiling belongs to the machine,
+not any component (verified with per-partition connections and multiple client
+processes). Partition scaling is a cross-machine story — measured at Stage 4.
 
 ```
 cargo test                      # correctness suite (18 tests)
