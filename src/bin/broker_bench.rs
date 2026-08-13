@@ -17,6 +17,12 @@ struct Args {
     value_bytes: usize,
     batch_records: usize,
     inflight: usize,
+    /// Batches are spread round-robin over this many partitions — each has
+    /// its own writer thread in the broker, so this is the parallelism knob.
+    partitions: u32,
+    /// One TCP connection per partition instead of one shared connection —
+    /// separates "the broker can't scale" from "one client socket can't".
+    conn_per_partition: bool,
     /// Target records/sec for open-loop mode; 0 = closed loop. Open loop
     /// paces batch sends on a fixed schedule and measures ack latency from
     /// the *scheduled* send time, so a backlog counts against latency
@@ -34,6 +40,8 @@ fn parse_args() -> Result<Args, String> {
         value_bytes: 100,
         batch_records: 100,
         inflight: 1,
+        partitions: 1,
+        conn_per_partition: false,
         rate: 0,
         acks: Acks::Written,
         acks_label: "written".into(),
@@ -54,6 +62,10 @@ fn parse_args() -> Result<Args, String> {
             "--inflight" => {
                 args.inflight = next("--inflight")?.parse().map_err(|e| format!("{e}"))?
             }
+            "--partitions" => {
+                args.partitions = next("--partitions")?.parse().map_err(|e| format!("{e}"))?
+            }
+            "--conn-per-partition" => args.conn_per_partition = true,
             "--rate" => args.rate = next("--rate")?.parse().map_err(|e| format!("{e}"))?,
             "--acks" => {
                 args.acks_label = next("--acks")?;
@@ -84,8 +96,8 @@ fn percentile(sorted: &[u64], q: f64) -> u64 {
     sorted[((sorted.len() - 1) as f64 * q).round() as usize]
 }
 
-const HEADER: &str = "acks,batch_records,inflight,target_rate,records,value_bytes,\
-elapsed_secs,records_per_sec,payload_mb_per_sec,p50_batch_us,p99_batch_us";
+const HEADER: &str = "acks,batch_records,inflight,partitions,connections,target_rate,records,\
+value_bytes,elapsed_secs,records_per_sec,payload_mb_per_sec,p50_batch_us,p99_batch_us";
 
 async fn await_ack(
     started: Instant,
@@ -107,10 +119,20 @@ async fn await_ack(
 }
 
 async fn run(args: &Args) -> Result<String, String> {
-    let conn = Connection::connect(&args.addr)
-        .await
-        .map_err(|e| e.to_string())?;
-    match conn.create_topic("bench", 1).await {
+    let conn_count = if args.conn_per_partition {
+        args.partitions as usize
+    } else {
+        1
+    };
+    let mut conns = Vec::with_capacity(conn_count);
+    for _ in 0..conn_count {
+        conns.push(
+            Connection::connect(&args.addr)
+                .await
+                .map_err(|e| e.to_string())?,
+        );
+    }
+    match conns[0].create_topic("bench", args.partitions).await {
         Ok(()) | Err(replog::client::ClientError::Broker(ErrorCode::TopicExists)) => {}
         Err(e) => return Err(e.to_string()),
     }
@@ -118,9 +140,9 @@ async fn run(args: &Args) -> Result<String, String> {
     let value: Vec<u8> = (0..args.value_bytes).map(|i| (i * 31) as u8).collect();
     let batches = args.records / args.batch_records;
     let records_sent = batches * args.batch_records;
-    let make_request = || Request::Produce {
+    let make_request = |batch_index: usize| Request::Produce {
         topic: "bench".into(),
-        partition: 0,
+        partition: (batch_index as u32) % args.partitions,
         acks: args.acks,
         records: (0..args.batch_records)
             .map(|_| ProduceRecord {
@@ -130,24 +152,30 @@ async fn run(args: &Args) -> Result<String, String> {
             .collect(),
     };
 
+    let conn_for = |batch_index: usize| {
+        &conns[(batch_index as u32 % args.partitions) as usize % conns.len()]
+    };
     let mut latencies_ns: Vec<u64>;
     let start = Instant::now();
     let elapsed = if args.rate > 0 {
-        let (elapsed, lat) = run_open_loop(&conn, args, batches, make_request, start).await?;
+        let (elapsed, lat) =
+            run_open_loop(&conns, args, batches, make_request, start).await?;
         latencies_ns = lat;
         elapsed
     } else {
         latencies_ns = Vec::with_capacity(batches);
         let mut inflight: VecDeque<(Instant, tokio::sync::oneshot::Receiver<Response>)> =
             VecDeque::new();
-        for _ in 0..batches {
-            let req = make_request();
+        for batch_index in 0..batches {
+            let req = make_request(batch_index);
             if args.acks == Acks::None {
-                conn.send_only(&req).map_err(|e| e.to_string())?;
+                conn_for(batch_index).send_only(&req).map_err(|e| e.to_string())?;
                 continue;
             }
             let sent_at = Instant::now();
-            let rx = conn.call_start(&req).map_err(|e| e.to_string())?;
+            let rx = conn_for(batch_index)
+                .call_start(&req)
+                .map_err(|e| e.to_string())?;
             inflight.push_back((sent_at, rx));
             while inflight.len() >= args.inflight {
                 let (t, rx) = inflight.pop_front().unwrap();
@@ -159,10 +187,12 @@ async fn run(args: &Args) -> Result<String, String> {
         }
         if args.acks == Acks::None {
             // Fence: an empty acked produce bounds when the broker has
-            // processed everything sent before it on this connection.
-            conn.produce("bench", 0, Acks::Written, Vec::new())
-                .await
-                .map_err(|e| e.to_string())?;
+            // processed everything sent before it on each connection.
+            for conn in &conns {
+                conn.produce("bench", 0, Acks::Written, Vec::new())
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
         }
         start.elapsed().as_secs_f64()
     };
@@ -170,10 +200,12 @@ async fn run(args: &Args) -> Result<String, String> {
     latencies_ns.sort_unstable();
     let payload_mb = (records_sent * args.value_bytes) as f64 / 1e6;
     Ok(format!(
-        "{},{},{},{},{},{},{:.3},{:.0},{:.2},{:.1},{:.1}",
+        "{},{},{},{},{},{},{},{},{:.3},{:.0},{:.2},{:.1},{:.1}",
         args.acks_label,
         args.batch_records,
         args.inflight,
+        args.partitions,
+        conn_count,
         args.rate,
         records_sent,
         args.value_bytes,
@@ -188,10 +220,10 @@ async fn run(args: &Args) -> Result<String, String> {
 /// Open-loop load: batches are sent on a fixed schedule regardless of ack
 /// progress; each ack task records latency relative to its scheduled send.
 async fn run_open_loop(
-    conn: &Connection,
+    conns: &[Connection],
     args: &Args,
     batches: usize,
-    make_request: impl Fn() -> Request,
+    make_request: impl Fn(usize) -> Request,
     start: Instant,
 ) -> Result<(f64, Vec<u64>), String> {
     use std::sync::{Arc, Mutex};
@@ -206,7 +238,8 @@ async fn run_open_loop(
     for i in 0..batches {
         let scheduled = start + interval * i as u32;
         tokio::time::sleep_until(scheduled.into()).await;
-        let rx = conn.call_start(&make_request()).map_err(|e| e.to_string())?;
+        let conn = &conns[(i as u32 % args.partitions) as usize % conns.len()];
+        let rx = conn.call_start(&make_request(i)).map_err(|e| e.to_string())?;
         let latencies = latencies.clone();
         let failures = failures.clone();
         tasks.push(tokio::spawn(async move {

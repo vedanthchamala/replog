@@ -22,9 +22,11 @@ BROKER_PID=""
 cleanup() { [ -n "$BROKER_PID" ] && kill "$BROKER_PID" 2>/dev/null || true; }
 trap cleanup EXIT
 
-run() { # acks batch_records inflight records [rate]
+run() { # acks batch_records inflight records [rate] [partitions] [cpp]
   local rate="${5:-0}"
-  local dir="$DATA_ROOT/$1-b$2-i$3-r$rate"
+  local parts="${6:-1}"
+  local cpp="${7:-}"
+  local dir="$DATA_ROOT/$1-b$2-i$3-r$rate-p$parts-c${cpp:-0}"
   local log="$dir.stdout"
   mkdir -p "$dir"
   "$BROKER" --listen 127.0.0.1:0 --data-dir "$dir" --fsync "$FSYNC" > "$log" &
@@ -36,9 +38,10 @@ run() { # acks batch_records inflight records [rate]
     sleep 0.05
   done
   [ -n "$addr" ] || { echo "broker did not start" >&2; exit 1; }
-  echo ">> acks=$1 batch=$2 inflight=$3 records=$4 rate=$rate" >&2
+  echo ">> acks=$1 batch=$2 inflight=$3 records=$4 rate=$rate partitions=$parts cpp=${cpp:-no}" >&2
   "$BENCH" --addr "$addr" --acks "$1" --batch-records "$2" --inflight "$3" \
-    --records "$4" --value-bytes 100 --rate "$rate" >> "$OUT"
+    --records "$4" --value-bytes 100 --rate "$rate" --partitions "$parts" \
+    ${cpp:+--conn-per-partition} >> "$OUT"
   kill "$BROKER_PID" 2>/dev/null || true
   wait "$BROKER_PID" 2>/dev/null || true
   BROKER_PID=""
@@ -65,6 +68,24 @@ run written 100  1 500000 100000
 run written 100  1 500000 400000
 run durable 1000 1 200000 20000
 run durable 1000 1 200000 40000
+
+# Partition scaling (Stage 3): round-robin over N writer threads.
+# Shared connection first, then one connection per partition (inflight scaled
+# with partition count so pipelining depth per connection stays 8).
+run written 100  8 1000000 0 1
+run written 100  8 1000000 0 2
+run written 100  8 1000000 0 4
+run written 100  8 1000000 0 8
+run durable 1000 8 500000  0 1
+run durable 1000 8 500000  0 2
+run durable 1000 8 500000  0 4
+run durable 1000 8 500000  0 8
+run written 100  16 1000000 0 2 1
+run written 100  32 1000000 0 4 1
+run written 100  64 2000000 0 8 1
+run durable 1000 16 500000  0 2 1
+run durable 1000 32 500000  0 4 1
+run durable 1000 64 1000000 0 8 1
 
 rm -rf "$DATA_ROOT"
 echo "wrote $OUT" >&2
