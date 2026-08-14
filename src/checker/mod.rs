@@ -58,6 +58,9 @@ pub struct Report {
     pub monotonicity_violations: Vec<String>,
     /// Same (topic, partition, offset) observed with different ids.
     pub divergent_offsets: Vec<String>,
+    /// Offsets in `0..=max_consumed` nobody consumed (only checked by
+    /// `verify_from_start`, which asserts readers began at offset 0).
+    pub offset_gaps: Vec<String>,
 }
 
 impl Report {
@@ -65,6 +68,7 @@ impl Report {
         self.missing_ids.is_empty()
             && self.monotonicity_violations.is_empty()
             && self.divergent_offsets.is_empty()
+            && self.offset_gaps.is_empty()
     }
 }
 
@@ -91,6 +95,9 @@ impl fmt::Display for Report {
         }
         for v in &self.divergent_offsets {
             writeln!(f, "  offset consistency: VIOLATED — {v}")?;
+        }
+        for v in &self.offset_gaps {
+            writeln!(f, "  gap-free: VIOLATED — {v}")?;
         }
         Ok(())
     }
@@ -191,7 +198,87 @@ impl History {
             duplicate_deliveries,
             monotonicity_violations,
             divergent_offsets,
+            offset_gaps: Vec::new(),
         }
+    }
+
+    /// `verify` plus the gap-free check: readers are asserted to have
+    /// consumed each partition from offset 0, so every offset in
+    /// `0..=max_consumed` must have been consumed by someone — a hole means
+    /// the log served non-contiguous history.
+    pub fn verify_from_start(&self) -> Report {
+        let mut report = self.verify();
+        let mut seen: HashMap<(&str, u32), HashSet<u64>> = HashMap::new();
+        for c in &self.consumed {
+            seen.entry((c.topic.as_str(), c.partition))
+                .or_default()
+                .insert(c.offset);
+        }
+        for ((topic, partition), offsets) in seen {
+            let max = *offsets.iter().max().unwrap();
+            if offsets.len() as u64 != max + 1 {
+                let first_hole = (0..=max).find(|o| !offsets.contains(o)).unwrap();
+                report.offset_gaps.push(format!(
+                    "{}-{}: {} of {} offsets consumed, first hole at {}",
+                    topic,
+                    partition,
+                    offsets.len(),
+                    max + 1,
+                    first_hole
+                ));
+            }
+        }
+        report.offset_gaps.sort();
+        report
+    }
+
+    /// Persists the history as plain text, one event per line
+    /// (`P <id> <topic>` / `C <consumer> <gen> <topic> <partition> <offset>
+    /// <id>`), so verification is genuinely offline. Names must not contain
+    /// whitespace.
+    pub fn save(&self, path: &std::path::Path) -> std::io::Result<()> {
+        use std::io::Write;
+        let mut out = std::io::BufWriter::new(std::fs::File::create(path)?);
+        for p in &self.produced {
+            debug_assert!(!p.topic.contains(char::is_whitespace));
+            writeln!(out, "P {} {}", p.id, p.topic)?;
+        }
+        for c in &self.consumed {
+            debug_assert!(!c.consumer.contains(char::is_whitespace));
+            writeln!(
+                out,
+                "C {} {} {} {} {} {}",
+                c.consumer, c.generation, c.topic, c.partition, c.offset, c.id
+            )?;
+        }
+        out.flush()
+    }
+
+    pub fn load(path: &std::path::Path) -> std::io::Result<History> {
+        use std::io::BufRead;
+        let bad = |line: &str| std::io::Error::other(format!("malformed history line: {line}"));
+        let mut history = History::new();
+        for line in std::io::BufReader::new(std::fs::File::open(path)?).lines() {
+            let line = line?;
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            match fields.as_slice() {
+                ["P", id, topic] => {
+                    history.record_produced(id.parse().map_err(|_| bad(&line))?, topic)
+                }
+                ["C", consumer, generation, topic, partition, offset, id] => history
+                    .record_consumed(
+                        consumer,
+                        generation.parse().map_err(|_| bad(&line))?,
+                        topic,
+                        partition.parse().map_err(|_| bad(&line))?,
+                        offset.parse().map_err(|_| bad(&line))?,
+                        id.parse().map_err(|_| bad(&line))?,
+                    ),
+                [] => {}
+                _ => return Err(bad(&line)),
+            }
+        }
+        Ok(history)
     }
 }
 
@@ -255,5 +342,41 @@ mod tests {
         let report = h.verify();
         assert!(report.is_ok(), "{report}");
         assert_eq!(report.duplicate_deliveries, 1);
+    }
+
+    #[test]
+    fn planted_gap_is_caught_only_by_from_start() {
+        let mut h = History::new();
+        for offset in [0u64, 1, 3] {
+            // offset 2 never consumed
+            h.record_produced(offset, "t");
+            h.record_consumed("c1", 0, "t", 0, offset, offset);
+        }
+        assert!(h.verify().offset_gaps.is_empty());
+        let report = h.verify_from_start();
+        assert_eq!(report.offset_gaps.len(), 1, "{report}");
+        assert!(report.offset_gaps[0].contains("first hole at 2"));
+        assert!(!report.is_ok());
+    }
+
+    #[test]
+    fn history_file_roundtrip_preserves_verdict() {
+        let mut h = History::new();
+        for id in 0..50u64 {
+            h.record_produced(id, "t");
+            h.record_consumed("reader-a", 0, "t", (id % 2) as u32, id / 2, id);
+        }
+        h.record_produced(999, "t"); // never consumed: a violation to preserve
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.txt");
+        h.save(&path).unwrap();
+        let loaded = History::load(&path).unwrap();
+        let (a, b) = (h.verify_from_start(), loaded.verify_from_start());
+        assert_eq!(a.produced_acked, b.produced_acked);
+        assert_eq!(a.consumed_total, b.consumed_total);
+        assert_eq!(a.missing_ids, b.missing_ids);
+        assert_eq!(a.missing_ids, vec![999]);
+        assert_eq!(a.duplicate_deliveries, b.duplicate_deliveries);
+        assert_eq!(a.offset_gaps, b.offset_gaps);
     }
 }

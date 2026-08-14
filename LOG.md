@@ -299,3 +299,66 @@ chain roughly triples it end to end — a good interview number precisely
 because it is not just the timeout.
 
 36 tests green. Next: Stage 5 torture harness (detailed plan now in PLAN.md).
+
+## 2026-08-14 (later) — Stage 5 COMPLETE: the torture harness, two client-side scalps, and a clean soak
+
+**Built** (per the detailed PLAN, scope signed off this morning): SplitMix64
+RNG (hand-rolled, reference vectors — the seed is the experiment id),
+`TcpProxy` with cut/heal (kills live connections, refuses new ones),
+two-phase `ProcCluster` start so each broker dials the controller through its
+own proxy, checker v2 (plain-text history files + gap-free-from-zero check),
+and `replog_torture`: seeded schedule of `kill -9` and control-plane
+partitions against real broker processes under continuous acks=all load, plus
+an acks=1 "chaff" producer aimed at random brokers (zombies included) whose
+ids are deliberately outside the contract, two independent readers per
+partition, and an offline verdict — `replog_torture --verify <dir>` re-checks
+any saved run with no cluster present.
+
+**War story 1 — the zombie that poisoned the client.** The process-level
+zombie test (cut the leader's controller link; it keeps serving while the
+controller elects around it) wedged the producer for its whole 15 s retry
+budget. Root cause in `ClusterClient::refresh_metadata`: first-successful-
+answer-wins, and the deposed leader still answers metadata requests with its
+stale view — itself as leader — from the front of the candidate list. Every
+refresh re-poisoned the client; every produce parked against an HWM that
+could never advance. Fix: metadata versions are monotonic at the controller,
+so ask every reachable broker and keep the newest. Lesson: "first answer
+wins" is "the fastest liar wins"; a version field nobody compares is
+decoration.
+
+**War story 2 — the divergence that refused to diverge.** The same test first
+manufactured "divergence" by writing acks=1 to the zombie right after the
+controller elected — and found all 20 records in the final *converged* log.
+Nothing was broken: a control-plane cut leaves the data plane up, and until
+each follower's next 300 ms heartbeat delivered the new epoch, their fetchers
+were still replicating from the zombie — the writes became fully-replicated
+legitimate history. "The leader changed" is one event *per observer*
+(controller-elected, follower-adopted, client-visible); the test now waits
+for the followers' own metadata views, at which point Stage 4's per-await
+fencing is exactly what keeps an in-flight zombie fetch from landing.
+
+**The verdicts** (`bench/run_torture.sh`, 3-broker cluster, RF=3, min-ISR 2,
+700 ms session, 2 partitions, values 100 B):
+
+- seed 1, 120 s: 30 faults (17 kills / 13 cuts), 5,095 acked — zero
+  violations, 0 extra duplicates.
+- seed 2, 120 s: 28 faults (9/19), 21,310 acked — zero violations, 30
+  genuine retry duplicates counted.
+- seed 3, 120 s: 28 faults (10/18), 20,180 acked — zero violations, 40 dups.
+- **soak, seed 42, 15 min: 214 faults (107 kills / 107 cuts), 32,310 acked
+  ids, every one consumed, offsets gap-free, both readers agree on every
+  offset, 10 retry duplicates — zero contract violations.** Hours-long form:
+  `SOAK_SECS=14400 bench/run_torture.sh`.
+
+Availability was honestly ugly where it should be (seed 1 drew double the
+kills and acked a quarter of seed 2's records — kills cost throughput, never
+correctness), and duplicates appeared exactly where retries fired, counted,
+never hidden. Determinism check: the 30 s shakedown and the 120 s run of
+seed 1 produce identical schedule prefixes.
+
+**43 tests green.** SPEC Stages 0–5 are all delivered: the durability
+contract (`kill -9` at acks=all, zero acked loss) holds deterministically,
+at the process boundary, and under seeded random schedules — verified by an
+offline checker from client-observed histories in every form. Stage 6
+(idempotent producer / compaction / sendfile / GCP deployment) remains the
+documented stretch tier.

@@ -3,7 +3,9 @@
 > Session pickup file. Read SPEC.md → PLAN.md → this file → LOG.md (latest entry) at
 > the start of every session, before touching code.
 
-**Stage:** 4 COMPLETE (process-boundary eval + bench done) → Stage 5 build (torture harness; detailed plan in PLAN.md, scope signed off 2026-08-14)
+**Stage:** 5 COMPLETE — SPEC Stages 0–5 all delivered; project core DONE.
+Stage 6 (idempotent producer / compaction / sendfile / GCP) is the optional
+stretch tier, unstarted.
 **Last updated:** 2026-08-14
 
 ## Done
@@ -40,22 +42,28 @@
   0/1/durable/all = 528k/208k/5.3k/88k rec/s — acks=all beats fsync-durability
   16×; RF=1 acks=all ≈ written (bookkeeping free); failover distribution over
   12 real kills: p50 2.59 s, max 2.66 s. 36 tests green.
+- **Stage 5 COMPLETE (2026-08-14)** — torture harness: SplitMix64 seeded
+  scheduler, TcpProxy control-plane partitions (live zombie leaders),
+  checker v2 (history files + gap check, offline `--verify`),
+  `replog_torture` bin + `bench/run_torture.sh`. 3 seeds × 120 s + 15-min
+  soak (214 faults, 32,310 acked ids): zero contract violations everywhere,
+  duplicates counted. Two war stories: client stale-metadata poisoning by a
+  zombie (fixed: newest-version-wins refresh) and the
+  divergence-that-refused-to-diverge lesson (LOG 2026-08-14). Process-level
+  zombie/stale-leader eval now in the suite. 43 tests green.
 
 ## In progress
 
-- Stage 5 build: torture harness per the now-detailed PLAN (seeded scheduler,
-  control-plane partitions by proxy, checker v2, `replog_torture` bin).
+- Nothing. Project core (SPEC Stages 0–5) is done.
 
-## Next actions (in order)
+## Next actions (only if the project is picked up again)
 
-1. Stage 5 components: `harness/rng.rs` (SplitMix64), `harness/proxy.rs`
-   (TcpProxy with cut/heal), ProcCluster two-phase start (per-broker
-   controller addr), checker v2 (save/load + gap check).
-2. `replog_torture` bin (seeded fault loop, acks=all + chaff workload, two
-   readers per partition, drain + verify) + `bench/run_torture.sh` matrix.
-3. Stage eval: 3 seeds x 120 s checker-clean + one >=10 min soak in-session;
-   violations become LOG war stories.
-4. Stage 5 milestone: LOG + STATUS + NOTES + PDF refresh + push.
+1. Stage 6 stretch, pick by interest/measurements: idempotent producer
+   (producer id + sequence dedup → exactly-once), `__offsets`/log compaction,
+   sendfile zero-copy fetch, or a 3× GCP e2 deployment (real-network numbers
+   for the replication tax and failover — the two caveats that most want
+   cross-machine data).
+2. Longer soaks anytime: `SOAK_SECS=14400 bench/run_torture.sh`.
 
 ## Standing rules for any session (any model)
 

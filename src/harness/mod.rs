@@ -19,6 +19,9 @@ use std::time::{Duration, Instant};
 use crate::client::Connection;
 use crate::proto::{ClusterMeta, ErrorCode, Request, Response};
 
+pub mod proxy;
+pub mod rng;
+
 /// Everything needed to spawn a cluster. Binary paths come from the caller:
 /// integration tests use `env!("CARGO_BIN_EXE_...")`, bench bins locate their
 /// siblings in the same target directory.
@@ -57,6 +60,10 @@ impl ClusterSpec {
 pub struct ProcBroker {
     pub id: u32,
     pub addr: String,
+    /// What this broker dials as the controller — the real address, or a
+    /// TcpProxy in front of it (the torture harness's partition lever).
+    /// Restarts reuse it.
+    pub controller_addr: String,
     child: Child,
 }
 
@@ -73,6 +80,9 @@ pub struct ProcCluster {
     controller: Child,
     /// `None` = currently killed (slot keeps broker ids stable for restart).
     pub brokers: Vec<Option<ProcBroker>>,
+    /// Controller addresses of killed brokers, so restart redials the same
+    /// (possibly proxied) address.
+    dead_controller_addrs: std::collections::HashMap<u32, String>,
 }
 
 impl Drop for ProcCluster {
@@ -104,6 +114,20 @@ fn spawn_and_get_addr(mut cmd: Command, stderr_log: &PathBuf) -> std::io::Result
 
 impl ProcCluster {
     pub async fn start(spec: ClusterSpec) -> std::io::Result<ProcCluster> {
+        let mut cluster = Self::start_controller_only(spec)?;
+        for id in 0..cluster.spec.brokers as u32 {
+            cluster.add_broker(id, None)?;
+        }
+        let n = cluster.spec.brokers;
+        cluster
+            .wait_for_meta("all brokers to register", |m| m.brokers.len() >= n)
+            .await;
+        Ok(cluster)
+    }
+
+    /// Phase one of a custom start: controller up, no brokers. The caller
+    /// then places proxies (or not) and calls `add_broker` per id.
+    pub fn start_controller_only(spec: ClusterSpec) -> std::io::Result<ProcCluster> {
         std::fs::create_dir_all(&spec.root)?;
         let mut controller_cmd = Command::new(&spec.controller_bin);
         controller_cmd.args([
@@ -116,25 +140,27 @@ impl ProcCluster {
         ]);
         let (controller, controller_addr) =
             spawn_and_get_addr(controller_cmd, &spec.root.join("controller.stderr.log"))?;
-
-        let mut cluster = ProcCluster {
+        Ok(ProcCluster {
             controller_addr,
             controller,
             brokers: Vec::new(),
+            dead_controller_addrs: std::collections::HashMap::new(),
             spec,
-        };
-        for id in 0..cluster.spec.brokers as u32 {
-            let broker = cluster.spawn_broker(id)?;
-            cluster.brokers.push(Some(broker));
-        }
-        let n = cluster.spec.brokers;
-        cluster
-            .wait_for_meta("all brokers to register", |m| m.brokers.len() >= n)
-            .await;
-        Ok(cluster)
+        })
     }
 
-    fn spawn_broker(&self, id: u32) -> std::io::Result<ProcBroker> {
+    /// Spawns broker `id` (must be the next free slot). `controller_addr`
+    /// overrides what the broker dials as the controller — pass a proxy's
+    /// address to make its control-plane link cuttable.
+    pub fn add_broker(&mut self, id: u32, controller_addr: Option<&str>) -> std::io::Result<()> {
+        assert_eq!(id as usize, self.brokers.len(), "broker ids are sequential");
+        let addr = controller_addr.unwrap_or(&self.controller_addr).to_string();
+        let broker = self.spawn_broker(id, &addr)?;
+        self.brokers.push(Some(broker));
+        Ok(())
+    }
+
+    fn spawn_broker(&self, id: u32, controller_addr: &str) -> std::io::Result<ProcBroker> {
         let data_dir = self.spec.root.join(format!("broker-{id}"));
         let mut cmd = Command::new(&self.spec.broker_bin);
         cmd.args([
@@ -147,7 +173,7 @@ impl ProcCluster {
             "--broker-id",
             &id.to_string(),
             "--controller-addr",
-            &self.controller_addr,
+            controller_addr,
             "--min-isr",
             &self.spec.min_isr.to_string(),
             "--replica-lag-ms",
@@ -155,7 +181,12 @@ impl ProcCluster {
         ]);
         let (child, addr) =
             spawn_and_get_addr(cmd, &self.spec.root.join(format!("broker-{id}.stderr.log")))?;
-        Ok(ProcBroker { id, addr, child })
+        Ok(ProcBroker {
+            id,
+            addr,
+            controller_addr: controller_addr.to_string(),
+            child,
+        })
     }
 
     /// Addresses of currently-live brokers.
@@ -201,14 +232,31 @@ impl ProcCluster {
     /// reserved so the broker can be restarted on its data dir.
     pub fn kill9(&mut self, id: usize) {
         let broker = self.brokers[id].take().expect("broker already dead");
+        self.dead_controller_addrs
+            .insert(broker.id, broker.controller_addr.clone());
         drop(broker); // Drop sends SIGKILL and reaps.
     }
 
-    /// Restarts a killed broker on its old data dir (new port) and waits for
-    /// the controller to see the re-registration.
+    /// Restarts a killed broker on its old data dir (new port, same
+    /// controller address as before — proxy included) and waits for the
+    /// controller to see the re-registration.
     pub async fn restart(&mut self, id: usize) -> std::io::Result<()> {
+        self.restart_with(id, None).await
+    }
+
+    /// Restart with an explicit controller address (rarely needed; `None`
+    /// reuses the address the broker had before it was killed).
+    pub async fn restart_with(
+        &mut self,
+        id: usize,
+        controller_addr: Option<&str>,
+    ) -> std::io::Result<()> {
         assert!(self.brokers[id].is_none(), "broker {id} is running");
-        let broker = self.spawn_broker(id as u32)?;
+        let addr = controller_addr
+            .map(|s| s.to_string())
+            .or_else(|| self.dead_controller_addrs.get(&(id as u32)).cloned())
+            .unwrap_or_else(|| self.controller_addr.clone());
+        let broker = self.spawn_broker(id as u32, &addr)?;
         let addr = broker.addr.clone();
         self.brokers[id] = Some(broker);
         self.wait_for_meta("restarted broker to re-register", |m| {

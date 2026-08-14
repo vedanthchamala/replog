@@ -47,7 +47,13 @@ impl ClusterClient {
         self.conns.lock().await.remove(addr);
     }
 
-    /// Asks every known address until someone answers with metadata.
+    /// Asks every reachable known address and keeps the *newest* metadata by
+    /// version. First-answer-wins is wrong here: a deposed leader cut off
+    /// from the controller still answers metadata requests with its stale
+    /// view, and if it happens to sit first in the candidate list it would
+    /// keep routing this client to itself (found by the Stage 5 torture
+    /// harness's zombie-leader scenario). Versions are monotonic at the
+    /// controller, so newest-wins converges on the live topology.
     pub async fn refresh_metadata(&self) -> Result<()> {
         let mut candidates: Vec<String> = self.bootstrap.clone();
         candidates.extend(
@@ -58,14 +64,17 @@ impl ClusterClient {
                 .iter()
                 .map(|(_, addr)| addr.clone()),
         );
-        candidates.dedup();
+        let mut seen = std::collections::HashSet::new();
+        candidates.retain(|addr| seen.insert(addr.clone()));
+        let mut best: Option<ClusterMeta> = None;
         let mut last_err = ClientError::Closed;
         for addr in candidates {
             match self.conn_to(&addr).await {
                 Ok(conn) => match conn.metadata().await {
                     Ok(cluster) => {
-                        *self.meta.lock().unwrap() = cluster;
-                        return Ok(());
+                        if best.as_ref().is_none_or(|b| cluster.version > b.version) {
+                            best = Some(cluster);
+                        }
                     }
                     Err(e) => {
                         self.drop_conn(&addr).await;
@@ -78,7 +87,13 @@ impl ClusterClient {
                 }
             }
         }
-        Err(last_err)
+        match best {
+            Some(cluster) => {
+                *self.meta.lock().unwrap() = cluster;
+                Ok(())
+            }
+            None => Err(last_err),
+        }
     }
 
     pub fn metadata(&self) -> ClusterMeta {

@@ -415,7 +415,7 @@ reassignment/rebalancing of replicas; HWM checkpointing is in-memory per
 leader epoch (a restarted leader re-derives it from follower fetches, and
 consumers may re-read — at-least-once holds).
 
-## Stage 5 (ACTIVE) — torture harness
+## Stage 5 (DONE 2026-08-14) — torture harness
 
 The closing argument. Everything so far proved the contract under *chosen*
 faults; Stage 5 proves it under faults nobody chose: a seeded scheduler drives
