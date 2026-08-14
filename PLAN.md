@@ -415,14 +415,112 @@ reassignment/rebalancing of replicas; HWM checkpointing is in-memory per
 leader epoch (a restarted leader re-derives it from follower fetches, and
 consumers may re-read — at-least-once holds).
 
-## Stage 5 (skeleton) — torture harness
+## Stage 5 (ACTIVE) — torture harness
 
-- Seeded fault scheduler: process kill/restart, network partition (proxy layer),
-  slow disk (optional). Client-side history logging (every produce attempt + ack,
-  every consumed record).
-- Offline checker: acked ⇒ eventually consumed (durability); per-partition offset
-  monotonicity, gap-free up to HWM; duplicate accounting (at-least-once budget).
-- Run matrix in CI-able script; every violation found becomes a LOG.md war story.
+The closing argument. Everything so far proved the contract under *chosen*
+faults; Stage 5 proves it under faults nobody chose: a seeded scheduler drives
+random kill/restart and control-plane partitions against a real 3-broker
+process cluster for as long as you let it, while an offline checker verifies
+the SPEC contract from client-observed histories alone. Scope signed off
+2026-08-14 (per skeleton).
+
+### Fault model (and its honest edges)
+
+- **kill -9 a random broker** (leader or follower — the scheduler doesn't
+  know which; that's the point), restart on the same data dir after a random
+  delay. At most one broker down at a time (min_isr=2 on RF=3: two down =
+  guaranteed unavailability, which tests nothing new).
+- **Control-plane partition by proxy:** each broker dials the controller
+  through its own TCP proxy (`--controller-addr` = proxy). Cutting the proxy
+  makes the controller declare the broker dead and re-elect while the broker
+  *keeps serving clients* — the zombie-leader scenario, live: divergent
+  acks=1 suffixes accumulate on the zombie and must be truncated via
+  EpochCheck when the proxy heals. This is the sharpest epoch-fencing test we
+  can run without full asymmetric data-path partitions.
+- **Not modeled, said out loud:** data-path partitions between brokers
+  (approximated by kills), controller death (static-controller
+  simplification, unchanged), slow-disk injection (skeleton's "optional",
+  dropped — macOS has no cheap dm-delay equivalent; noted as future work).
+- The controller is never killed; producers/consumers live in the torture
+  process and are never killed (client crashes don't threaten the *broker's*
+  contract).
+
+### Components
+
+```
+src/harness/rng.rs      SplitMix64 — seeded, hand-rolled (no rand dep), so a
+                        schedule is reproducible from its seed
+src/harness/proxy.rs    TcpProxy: listen addr, forward to target; disable() kills
+                        live connections and refuses new ones; enable() heals
+src/harness/mod.rs      ProcCluster grows: per-broker controller addr (for the
+                        proxies), start_controller_only + add_broker phases
+src/checker/mod.rs      v2: history file save/load (line format, no serde),
+                        gap-free-up-to-max check per partition
+src/bin/replog_torture.rs  the harness binary
+bench/run_torture.sh    run matrix: N seeds x short duration (CI-able), plus
+                        SOAK_SECS env for the hours-long form
+```
+
+### The torture binary
+
+`replog_torture --seed S --duration-secs D [--brokers 3] [--partitions 2]
+[--history-dir target/torture] [--min-fault-gap-ms 800 --max-fault-gap-ms 3000]
+[--min-heal-ms 500 --max-heal-ms 4000]`
+
+- Starts controller + per-broker controller proxies + 3 brokers (RF=3,
+  min_isr=2, session 700 ms, fsync batch:1MiB:5ms).
+- **Workload:** one producer per partition at acks=all (unique ids stamped in
+  values; only *acked* ids enter the history as produced) + one acks=1
+  "chaff" producer whose ids are deliberately NOT in the contract (they
+  manufacture divergence on zombies; the contract says nothing about them) +
+  **two independent readers per partition** (so same-offset ⇒ same-id is a
+  real cross-reader check), fetching via ClusterClient from offset 0,
+  logging every consumed record.
+- **Scheduler loop:** sleep a seeded-random gap, pick a seeded-random fault —
+  kill-9 a random live broker, or cut a random healthy proxy — schedule its
+  heal (restart / proxy enable) after a seeded-random delay. Cap: one active
+  fault at a time. Every action logged with a timestamp to the schedule log.
+- **Shutdown sequence (order matters):** stop faulting → heal everything →
+  wait full ISR on every partition → stop producers → readers drain until
+  consumed ⊇ acked (bounded wait) → write history files → run checker →
+  print report, exit nonzero on any violation.
+- Histories are written as plain-text line files (`P id topic` / `C consumer
+  gen topic partition offset id`) so the checker is genuinely *offline*:
+  `replog_torture --verify <dir>` re-checks any saved run.
+
+### Checker v2 additions
+
+- `History::save/load` (the line format above).
+- **Gap-free:** per (topic, partition), every offset in `0..=max_consumed`
+  was consumed by someone — a hole means a broker served non-contiguous
+  history (readers fetch sequentially, so this should be impossible unless
+  the log itself is wrong).
+- Existing checks unchanged: acked ⇒ consumed (the durability contract),
+  duplicates counted not hidden, per-reader monotonicity, same-offset ⇒
+  same-id across readers.
+
+### Reproducibility, honestly stated
+
+The seed fully determines the fault *schedule* (which fault, which broker,
+what delays). It does NOT determine the interleaving with real processes and
+real sockets — reruns of a failing seed reproduce the scenario shape, not the
+exact byte-level race. That is the standard limit of process-level torture
+(same as Jepsen); say it before an interviewer does.
+
+### Tests / pass conditions (executable form)
+
+1. Unit: SplitMix64 known-answer vectors; same seed ⇒ identical fault
+   schedule; history file round-trip; checker catches a planted gap /
+   missing id / divergent offset.
+2. Proxy: cut kills live connections and refuses new ones; heal restores;
+   a broker behind a cut proxy is declared dead and re-registers on heal.
+3. **The stage eval:** `run_torture.sh` — 3 seeds × 120 s each, kills +
+   partitions interleaved, checker reports zero contract violations
+   (duplicates allowed and counted). Plus one longer in-session soak
+   (≥ 10 min). The hours-long soak stays available:
+   `SOAK_SECS=14400 bench/run_torture.sh`.
+4. Every violation found during development lands in LOG.md as a war story
+   with root cause and fix.
 
 ## Stage 6 (stretch, pick by what the measurements say)
 

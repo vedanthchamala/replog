@@ -23,6 +23,11 @@ struct Args {
     /// One TCP connection per partition instead of one shared connection —
     /// separates "the broker can't scale" from "one client socket can't".
     conn_per_partition: bool,
+    /// Replication factor. 0 = standalone broker (Stage 2/3 rows). >0 =
+    /// cluster mode: the topic is created replicated, the bench waits for a
+    /// full ISR on every partition, and each partition's batches go straight
+    /// to its leader (leader_epoch 0 = "don't care", we dialed the leader).
+    rf: u32,
     /// Target records/sec for open-loop mode; 0 = closed loop. Open loop
     /// paces batch sends on a fixed schedule and measures ack latency from
     /// the *scheduled* send time, so a backlog counts against latency
@@ -42,6 +47,7 @@ fn parse_args() -> Result<Args, String> {
         inflight: 1,
         partitions: 1,
         conn_per_partition: false,
+        rf: 0,
         rate: 0,
         acks: Acks::Written,
         acks_label: "written".into(),
@@ -66,6 +72,7 @@ fn parse_args() -> Result<Args, String> {
                 args.partitions = next("--partitions")?.parse().map_err(|e| format!("{e}"))?
             }
             "--conn-per-partition" => args.conn_per_partition = true,
+            "--rf" => args.rf = next("--rf")?.parse().map_err(|e| format!("{e}"))?,
             "--rate" => args.rate = next("--rate")?.parse().map_err(|e| format!("{e}"))?,
             "--acks" => {
                 args.acks_label = next("--acks")?;
@@ -73,6 +80,7 @@ fn parse_args() -> Result<Args, String> {
                     "none" => Acks::None,
                     "written" => Acks::Written,
                     "durable" => Acks::Durable,
+                    "all" => Acks::All,
                     other => return Err(format!("unknown acks {other}")),
                 };
             }
@@ -96,7 +104,7 @@ fn percentile(sorted: &[u64], q: f64) -> u64 {
     sorted[((sorted.len() - 1) as f64 * q).round() as usize]
 }
 
-const HEADER: &str = "acks,batch_records,inflight,partitions,connections,target_rate,records,\
+const HEADER: &str = "acks,rf,batch_records,inflight,partitions,connections,target_rate,records,\
 value_bytes,elapsed_secs,records_per_sec,payload_mb_per_sec,p50_batch_us,p99_batch_us";
 
 async fn await_ack(
@@ -118,24 +126,85 @@ async fn await_ack(
     }
 }
 
-async fn run(args: &Args) -> Result<String, String> {
-    let conn_count = if args.conn_per_partition {
-        args.partitions as usize
-    } else {
-        1
-    };
-    let mut conns = Vec::with_capacity(conn_count);
-    for _ in 0..conn_count {
-        conns.push(
-            Connection::connect(&args.addr)
-                .await
-                .map_err(|e| e.to_string())?,
-        );
-    }
-    match conns[0].create_topic("bench", args.partitions).await {
+/// Cluster mode: create the replicated topic, wait for a full ISR everywhere
+/// (so acks=all measures steady-state replication, not startup), and return
+/// one connection per partition, dialed to that partition's leader.
+async fn cluster_conns(args: &Args) -> Result<(Vec<Connection>, usize), String> {
+    let bootstrap = Connection::connect(&args.addr)
+        .await
+        .map_err(|e| e.to_string())?;
+    match bootstrap
+        .create_topic_replicated("bench", args.partitions, args.rf)
+        .await
+    {
         Ok(()) | Err(replog::client::ClientError::Broker(ErrorCode::TopicExists)) => {}
         Err(e) => return Err(e.to_string()),
     }
+    let deadline = Instant::now() + std::time::Duration::from_secs(20);
+    let meta = loop {
+        let meta = bootstrap.metadata().await.map_err(|e| e.to_string())?;
+        let ready = meta.topics.iter().find(|t| t.name == "bench").is_some_and(|t| {
+            t.partitions.len() == args.partitions as usize
+                && t.partitions
+                    .iter()
+                    .all(|p| p.leader >= 0 && p.isr.len() == args.rf as usize)
+        });
+        if ready {
+            break meta;
+        }
+        if Instant::now() >= deadline {
+            return Err("cluster never reached a full ISR on every partition".into());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
+    let topic = meta.topics.iter().find(|t| t.name == "bench").unwrap();
+    let mut by_addr: std::collections::HashMap<String, Connection> = Default::default();
+    let mut conns = Vec::with_capacity(args.partitions as usize);
+    for p in &topic.partitions {
+        let addr = meta
+            .brokers
+            .iter()
+            .find(|(id, _)| *id == p.leader as u32)
+            .map(|(_, a)| a.clone())
+            .ok_or("leader missing from broker list")?;
+        let conn = match by_addr.get(&addr) {
+            Some(c) => c.clone(),
+            None => {
+                let c = Connection::connect(&addr).await.map_err(|e| e.to_string())?;
+                by_addr.insert(addr, c.clone());
+                c
+            }
+        };
+        conns.push(conn);
+    }
+    let unique = by_addr.len();
+    Ok((conns, unique))
+}
+
+async fn run(args: &Args) -> Result<String, String> {
+    let (conns, conn_count) = if args.rf > 0 {
+        cluster_conns(args).await?
+    } else {
+        let conn_count = if args.conn_per_partition {
+            args.partitions as usize
+        } else {
+            1
+        };
+        let mut conns = Vec::with_capacity(conn_count);
+        for _ in 0..conn_count {
+            conns.push(
+                Connection::connect(&args.addr)
+                    .await
+                    .map_err(|e| e.to_string())?,
+            );
+        }
+        match conns[0].create_topic("bench", args.partitions).await {
+            Ok(()) | Err(replog::client::ClientError::Broker(ErrorCode::TopicExists)) => {}
+            Err(e) => return Err(e.to_string()),
+        }
+        let count = conns.len();
+        (conns, count)
+    };
 
     let value: Vec<u8> = (0..args.value_bytes).map(|i| (i * 31) as u8).collect();
     let batches = args.records / args.batch_records;
@@ -187,10 +256,11 @@ async fn run(args: &Args) -> Result<String, String> {
             await_ack(t, rx, &mut latencies_ns).await?;
         }
         if args.acks == Acks::None {
-            // Fence: an empty acked produce bounds when the broker has
-            // processed everything sent before it on each connection.
-            for conn in &conns {
-                conn.produce("bench", 0, Acks::Written, Vec::new())
+            // Fence: an empty acked produce per partition bounds when the
+            // broker has processed everything sent before it.
+            for p in 0..args.partitions {
+                conn_for(p as usize)
+                    .produce("bench", p, Acks::Written, Vec::new())
                     .await
                     .map_err(|e| e.to_string())?;
             }
@@ -201,8 +271,9 @@ async fn run(args: &Args) -> Result<String, String> {
     latencies_ns.sort_unstable();
     let payload_mb = (records_sent * args.value_bytes) as f64 / 1e6;
     Ok(format!(
-        "{},{},{},{},{},{},{},{},{:.3},{:.0},{:.2},{:.1},{:.1}",
+        "{},{},{},{},{},{},{},{},{},{:.3},{:.0},{:.2},{:.1},{:.1}",
         args.acks_label,
+        args.rf,
         args.batch_records,
         args.inflight,
         args.partitions,

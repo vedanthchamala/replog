@@ -8,5 +8,6 @@ pub mod broker;
 pub mod checker;
 pub mod controller;
 pub mod client;
+pub mod harness;
 pub mod proto;
 pub mod storage;

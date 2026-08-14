@@ -21,6 +21,7 @@ fn parse_args() -> Result<(String, BrokerConfig), String> {
     let mut controller_addr = None;
     let mut advertise_addr = None;
     let mut min_isr = 2u32;
+    let mut replica_lag_ms = None;
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
         match flag.as_str() {
@@ -47,6 +48,14 @@ fn parse_args() -> Result<(String, BrokerConfig), String> {
                     .parse()
                     .map_err(|e| format!("{e}"))?
             }
+            "--replica-lag-ms" => {
+                replica_lag_ms = Some(
+                    it.next()
+                        .ok_or("--replica-lag-ms needs a value")?
+                        .parse()
+                        .map_err(|e| format!("{e}"))?,
+                )
+            }
             other => return Err(format!("unknown flag {other}")),
         }
     }
@@ -60,6 +69,9 @@ fn parse_args() -> Result<(String, BrokerConfig), String> {
     config.controller_addr = controller_addr;
     config.advertise_addr = advertise_addr;
     config.min_insync_replicas = min_isr;
+    if let Some(ms) = replica_lag_ms {
+        config.replica_lag_ms = ms;
+    }
     Ok((listen, config))
 }
 

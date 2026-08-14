@@ -3,8 +3,8 @@
 > Session pickup file. Read SPEC.md → PLAN.md → this file → LOG.md (latest entry) at
 > the start of every session, before touching code.
 
-**Stage:** 4 core complete (evals green) → Stage 4 close-out (bench + process-boundary eval)
-**Last updated:** 2026-08-13
+**Stage:** 4 COMPLETE (process-boundary eval + bench done) → Stage 5 build (torture harness; detailed plan in PLAN.md, scope signed off 2026-08-14)
+**Last updated:** 2026-08-14
 
 ## Done
 
@@ -33,20 +33,29 @@
   truncates via epoch check. Three bugs found and fixed on the way (LOG
   2026-08-13: parked-waiter connection hang, per-await fencing, ISR
   caught-up-recency rule). 35 tests green.
+- **Stage 4 COMPLETE (2026-08-14)** — `src/harness/` process-cluster module
+  (real binaries, SIGKILL, restart-on-data-dir); process-boundary failover
+  eval green (1200/1200 acked survive a real `kill -9`, checker-verified);
+  replication bench (`run_cluster_bench.sh`): at batch=100 RF=3 acks
+  0/1/durable/all = 528k/208k/5.3k/88k rec/s — acks=all beats fsync-durability
+  16×; RF=1 acks=all ≈ written (bookkeeping free); failover distribution over
+  12 real kills: p50 2.59 s, max 2.66 s. 36 tests green.
 
 ## In progress
 
-- Stage 4 close-out: measurements + process-boundary eval remain (see next).
+- Stage 5 build: torture harness per the now-detailed PLAN (seeded scheduler,
+  control-plane partitions by proxy, checker v2, `replog_torture` bin).
 
 ## Next actions (in order)
 
-1. Stage 4 bench per PLAN: produce throughput/latency at acks=0/1/all on the
-   3-broker localhost cluster (replication overhead curve) + failover-time
-   distribution over repeated kills (`bench/`, CSV + plot).
-2. Process-boundary failover eval: broker as child processes, real `kill -9`
-   (the current eval is the in-process form; softenings flagged in NOTES §7).
-3. Stage 4 milestone: LOG + STATUS + NOTES + PDF refresh + push.
-4. Stage 5: torture harness (seeded fault schedules, offline checker).
+1. Stage 5 components: `harness/rng.rs` (SplitMix64), `harness/proxy.rs`
+   (TcpProxy with cut/heal), ProcCluster two-phase start (per-broker
+   controller addr), checker v2 (save/load + gap check).
+2. `replog_torture` bin (seeded fault loop, acks=all + chaff workload, two
+   readers per partition, drain + verify) + `bench/run_torture.sh` matrix.
+3. Stage eval: 3 seeds x 120 s checker-clean + one >=10 min soak in-session;
+   violations become LOG war stories.
+4. Stage 5 milestone: LOG + STATUS + NOTES + PDF refresh + push.
 
 ## Standing rules for any session (any model)
 

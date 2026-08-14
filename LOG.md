@@ -248,3 +248,54 @@ bench and failover-time distribution over repeated kills, then the
 process-boundary form of the failover eval (real `kill -9`, real processes;
 the in-process abort's two softenings are flagged in NOTES §7), then LOG/STATUS/
 NOTES/PDF milestone refresh.
+
+## 2026-08-14 — Stage 4 COMPLETE: process-boundary kill -9 eval + the replication-cost and failover numbers
+
+**Process harness.** New `src/harness/` library module: spawns the real
+`replog_controller`/`replog_broker` binaries as child processes, parses their
+listen line, SIGKILLs by broker id, restarts on the same data dir, and polls
+controller metadata for cluster state. Library code on purpose — the Stage 4
+process eval, the failover bench, and the Stage 5 torture harness all drive
+clusters the same way. Nothing in-process survives a SIGKILL, which retires
+the two softenings flagged in NOTES §7.
+
+**Process-boundary failover eval green** (`tests/process_failover_tests.rs`,
+now in the default suite): 3 broker *processes*, controller session 700 ms,
+1200 records at acks=all through `ClusterClient`, real `kill -9` of the
+leader process at record 400. Checker verdict: **1200/1200 acked ids
+consumed, zero lost, zero duplicates this run, new leader elected.** The SPEC
+Stage 4 pass condition now holds at the process boundary, not just in-process.
+
+**Replication-overhead bench** (`bench/run_cluster_bench.sh` → `cluster_produce.csv`
++ `.png`; broker_bench grew `--rf` + `--acks all` with leader routing; fresh
+3-broker cluster per row, localhost, 100 B values, fsync batch:1MiB:5ms):
+
+- batch=100, RF=3, sync: acks=0 **528k**, acks=1 **208k**, acks=durable
+  **5.3k**, acks=all **88k** rec/s.
+- The Kafka lesson, measured on our own system: at batch=100, **acks=all is
+  ~16× faster than acks=durable** (88k vs 5.3k) while giving the *stronger*
+  practical guarantee (survives machine death, which an fsync does not).
+  Durability by replication beats durability by disk barrier on this SSD by
+  an order of magnitude.
+- RF=1 baseline on the same binaries: acks=all 479k ≈ acks=written 416k —
+  the acks=all *bookkeeping* is free; the cost is replication itself
+  (208k→88k written→all at RF=3, a 2.4× tax).
+- Honest finding: acks=all pipelining peaks at depth 2 (103k) and *degrades*
+  to 60k at depth 8 (p99 27 ms) — three brokers + client share one CPU, so
+  deeper pipelines only grow queues here. On separate machines (latency-
+  dominated, not CPU-contended) depth should help; that measurement needs
+  real hosts. Caveat recorded in NOTES §7.
+
+**Failover-time distribution** (`failover_bench`, 12 real kill -9 of the
+leader under continuous acks=all load, session timeout 700 ms): gap from kill
+to first post-kill ack **min 2.17 s, p50 2.59 s, p90 2.65 s, max 2.66 s** —
+tight, and ~0.8 s slower than the in-process eval's ~1.8 s single sample.
+The extra is real-world plumbing the in-process form skipped: the client must
+discover dead TCP connections, brokers learn the new epoch on their next
+300 ms heartbeat, the new leader's HWM waits for the surviving follower's
+first fetch of the new epoch, and the client retries on a 100 ms backoff.
+Detection (700 ms) is still the largest single term, but the propagation
+chain roughly triples it end to end — a good interview number precisely
+because it is not just the timeout.
+
+36 tests green. Next: Stage 5 torture harness (detailed plan now in PLAN.md).
