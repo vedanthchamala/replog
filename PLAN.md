@@ -522,8 +522,120 @@ exact byte-level race. That is the standard limit of process-level torture
 4. Every violation found during development lands in LOG.md as a war story
    with root cause and fix.
 
-## Stage 6 (stretch, pick by what the measurements say)
+## Stage 6 (ACTIVE, planned 2026-09-08) — cross-system fault-injection harness
+
+**Problem.** Stages 4–5 proved replog's durability contract under seeded
+faults, but the harness can only ever judge replog: its fault backend is
+`kill -9` on child processes plus a proxy on the controller link, and its
+workload speaks replog's own protocol. That makes every torture verdict a
+statement about one system with no reference point, and it leaves a hole the
+PLAN already admits — data-path partitions are not modeled. A checker that
+never sees a different implementation also never gets to demonstrate that it
+would notice anything at all.
+
+**Solution.** Turn the harness into a target-agnostic tool: one seeded fault
+scheduler, one offline checker, pluggable *fault backends* and *workload
+adapters*. Run replog and a production Kafka-API system (Redpanda first, Apache
+Kafka as stretch) under identical fault schedules, in identical containers,
+with matched failure-detection timeouts, and compare what clients observe:
+contract violations, duplicates, failover gap decomposed hop by hop, and
+availability over time. Prove the tool's sensitivity with controls whose
+outcome is known in advance before trusting any "zero violations" verdict.
+
+### Design
+
+```
+src/torture/mod.rs        Schedule loop + verdict, generic over the two traits
+src/torture/cluster.rs    trait FaultTarget: brokers(), fault(i, Fault), heal(i, Fault),
+                          leader_of(topic, p), wait_healthy(), bootstrap_addrs()
+src/torture/workload.rs   trait Workload: producer(p) / reader(p, name) handles that
+                          record into checker::History
+src/torture/docker.rs     Docker fault backend: shells out to `docker` (kill -s KILL /
+                          start, pause / unpause, network disconnect / connect)
+src/torture/replog.rs     Workload + FaultTarget for replog (ProcCluster or Docker)
+src/torture/kafka.rs      Workload + FaultTarget for any Kafka-API cluster (rdkafka;
+                          leader via Metadata API poll; cargo feature `kafka`)
+src/torture/failover.rs   Failover decomposition: t0 fault → t1 metadata-visible new
+                          leader → t2 first post-fault ack; per-second ack timeline
+src/bin/replog_torture.rs Thin CLI: --target proc|replog-docker|redpanda|kafka
+deploy/redpanda/          3-broker compose (NOT dev-container mode: write caching off)
+deploy/replog/            Dockerfile (multi-stage) + 1 controller + 3 broker compose
+deploy/kafka/             3-node KRaft compose (stretch)
+bench/run_faults.sh       The matrix; bench/plot_faults.py the plots
+```
+
+**Fault vocabulary (identical on every Docker target):**
+
+- `kill` — SIGKILL the broker container's process (`docker kill -s KILL`),
+  `docker start` on the same data volume after the heal delay. Same
+  durability class as Stage 4/5: the Linux VM's page cache survives, so
+  this is process crash, not power loss. Said in every table.
+- `pause` — `docker pause` (cgroup freezer, SIGSTOP-equivalent): sockets stay
+  open, nothing progresses. Detected only by timeouts, never by TCP resets —
+  the frozen-node case Stage 5 did not have.
+- `isolate` — `docker network disconnect` from the *peers* network only. Each
+  broker sits on `peers` plus its own private `edge-N` network that publishes
+  its client port to the host, so an isolated broker still serves clients
+  while peers and the controller/Raft group lose it: the live zombie leader,
+  now on the data path, for both systems. (Per-broker edge networks are
+  deliberate: a shared clients network would let peers re-resolve the victim
+  through it and silently defeat the partition.)
+
+Sequential faults, one victim at a time (as Stage 5), seeded gaps and heal
+delays from SplitMix64; `--faults kill,pause,isolate` selects the mix.
+
+**Two advertised addresses for replog.** Redpanda has internal/external
+listeners; replog today advertises one address for peers and clients, which
+cannot work with per-broker edge networks. Broker registration gains a peer
+address (`--advertise-peer-addr`), the controller stores and serves both,
+follower fetchers dial the peer address, clients the client address. Default
+is peer = client, so Stage 2–5 tests and the `proc` target are unchanged.
+
+**Matched detection timeouts.** A failover gap is mostly the failure-detection
+constant somebody chose, so the comparison sets them equal: replog controller
+session timeout and replica lag, Redpanda `raft_heartbeat_timeout_ms`, Kafka
+`broker.session.timeout.ms` + `replica.lag.time.max.ms` — all at the same
+value (1000 ms / 1500 ms), and every table names it. Redpanda runs with
+`write_caching_default=false` so acks=all means fsynced-on-majority, matching
+replog's durable acks; the write-caching-on configuration is run separately
+as a designed-violation control, never mixed into the headline numbers.
+
+**Failover decomposition.** A dedicated metadata poller (20 ms) per target
+records t1 = first observation of a new leader for the victim's partitions.
+The producer records t2 = first successful ack after the fault. `t1−t0` is
+detection + election as visible through the metadata API; `t2−t1` is client
+recovery (metadata refresh, reconnect, retry backoff). Both targets use the
+metadata API, not server internals, so the split is comparable.
+
+### Checkpoints (each has an executable proof; do not proceed on a failed one)
+
+| # | Checkpoint | Proof that it works |
+|---|---|---|
+| 0 | Plan signed off; working tree builds; docs updated | `cargo test` green; this section committed |
+| 1 | Docker backend + 3-broker Redpanda compose | `replog_torture probe --target redpanda`: for each fault applied to the current leader of a RF=3 topic: leadership moves to another broker within 3× the detection timeout; `kill` → client port refuses; `pause` → connect succeeds but produce times out; `isolate` → connect + metadata still succeed on the victim while peers elect around it; after heal, cluster reports fully replicated. Printed as a table, exit nonzero on any failed expectation. |
+| 2 | rdkafka workload adapter → checker histories | 30 s Redpanda run, no faults: zero violations, zero duplicates, `--verify` on the saved history agrees; ack rate within an order of magnitude of replog's at the same pacing |
+| 3 | Sensitivity controls (the checker must be able to fail) | (a) acks=1 under `isolate` of the leader on Redpanda: missing acked ids > 0 — the zombie acks writes it cannot replicate; acks=all on the same seed: zero missing. (b) replog mutant `REPLOG_MUTANT=first_answer_wins` (Stage 5 bug re-enabled): torture must detect the wedge/violation within the same seeds that pass unmutated. (c) `write_caching_default=true` + fast double-kill: run and report whatever happens, honestly. |
+| 4 | Redpanda torture matrix | 3 seeds × 120 s, kill/pause/isolate mixed, acks=all: violations, duplicates, failover CSV, timeline CSV committed under `bench/results/faults/redpanda/` |
+| 5 | replog in Docker on the same backend | Two-address registration; `--target replog-docker`; same seeds, same faults, same timeouts; side-by-side table: violations, dups, failover p50/p90/max decomposed, follower-kill stall, availability (fraction of seconds with zero acks) |
+| 6 | Apache Kafka KRaft target (stretch) | Same matrix; three-way table ISR-lite / ISR / Raft |
+| 7 | Write-up | README section with the tables and plots, every number traceable to a command; LOG, STATUS, interview notes; PDF at milestone |
+
+### Honest edges (say them first)
+
+- Process crash, not power loss (page cache survives in the VM), for every
+  target alike.
+- Docker Desktop on macOS: all brokers share one VM's disk and CPU; absolute
+  throughput numbers are not the point, the relative behavior under identical
+  faults is.
+- Leader change is timestamped through the metadata API polled at 20 ms, not
+  from server internals: `t1` carries up to one poll interval plus an RTT.
+- Jepsen tested Redpanda in 2022 with far more fault diversity. This tool's
+  claim is narrower: identical schedules across implementations including my
+  own, hop-by-hop failover decomposition, and demonstrated checker
+  sensitivity — not bug-hunting a production system.
+
+## Stage 7 (stretch, pick by what the measurements say)
 
 Idempotent producer (producer id + sequence dedup) → exactly-once; compaction;
 sendfile/`copy_file_range` zero-copy fetch path; 3× GCP e2 deployment with
-cross-zone latency measured.
+cross-zone latency measured (the harness gains a real-network backend).

@@ -74,6 +74,9 @@ measured — by hand.
   consumers; in-sync-replica (ISR) set tracked by the leader; `acks=0|1|all`; controller
   elects leaders; leader-epoch fencing so a rejoining stale leader truncates divergence
   instead of splitting the log.
+- **Cross-system harness** (Stage 6): the same scheduler and checker driving Docker
+  fault backends (kill / pause / isolate-from-peers) and pluggable workload adapters, so
+  replog and Redpanda/Kafka are judged under identical fault schedules.
 - **Torture harness** (Stage 5): workload generator + fault injector (`kill -9`,
   partition-by-proxy, disk-full) + an offline history checker that verifies the
   durability/ordering contract from client-observed histories alone.
@@ -91,7 +94,8 @@ not done until its pass conditions all hold.
 | 3 | Partitions + groups | 2 consumers split N partitions; kill one → rebalance; every record delivered ≥ once, verified by checker. |
 | 4 | Replication + failover | `kill -9` the leader mid-stream at `acks=all` → new leader elected, **zero acked records lost** (checker-verified); stale-leader rejoin truncates via epoch check; measured: failover time, replication overhead at acks=0/1/all. |
 | 5 | Torture harness | Randomized fault schedule (seeded, reproducible) over hours: checker finds zero contract violations; every violation found during development is documented in LOG.md with root cause and fix. |
-| 6 (stretch) | One or more of: idempotent producer, log compaction, sendfile zero-copy reads, 3-broker GCP deployment | Each with its own measured before/after. |
+| 6 | Cross-system fault-injection harness | The torture harness becomes target-agnostic (pluggable fault backends + workload adapters); replog and a production Kafka-API system run identical seeded schedules in identical containers with matched detection timeouts; sensitivity controls with known outcomes pass before any zero-violation verdict is reported; failover gap decomposed hop by hop, side by side. |
+| 7 (stretch) | One or more of: idempotent producer, log compaction, sendfile zero-copy reads, 3-broker GCP deployment | Each with its own measured before/after. |
 
 ## Measurement discipline
 
