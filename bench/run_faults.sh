@@ -23,7 +23,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-TARGET="${1:?target required: redpanda | replog}"; shift || true
+TARGET="${1:?target required: redpanda | replog | kafka}"; shift || true
 SEEDS=("$@"); [ "${#SEEDS[@]}" -gt 0 ] || SEEDS=(1 2 3)
 DURATION="${DURATION_SECS:-120}"
 DETECT="${DETECT_MS:-1000}"

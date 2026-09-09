@@ -140,6 +140,32 @@ pub fn majority(views: &[Option<Vec<i32>>], partitions: u32) -> Vec<i32> {
         .collect()
 }
 
+/// Health as the harness defines it: the target says it is fully replicated
+/// *and* every broker answers a metadata request itself. The second half
+/// matters right after a restart — a health API can report the pre-fault
+/// picture for a few seconds while the restarted process is still booting,
+/// and a fault landing on a half-booted broker is a different experiment.
+pub async fn wait_fully_healthy<T: FaultTarget>(
+    target: &T,
+    topic: &str,
+    partitions: u32,
+    timeout: std::time::Duration,
+) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + timeout;
+    target.wait_healthy(topic, partitions, timeout).await?;
+    loop {
+        let v = views(target, topic, partitions).await;
+        if v.iter().all(|x| x.as_ref().is_some_and(|l| l.iter().all(|&p| p >= 0))) {
+            return Ok(());
+        }
+        if std::time::Instant::now() > deadline {
+            let silent: Vec<usize> = v.iter().enumerate().filter(|(_, x)| x.is_none()).map(|(i, _)| i).collect();
+            return Err(format!("brokers {silent:?} not answering metadata after health"));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+}
+
 pub async fn majority_leaders<T: FaultTarget>(target: &T, topic: &str, partitions: u32) -> Vec<i32> {
     majority(&views(target, topic, partitions).await, partitions)
 }

@@ -19,6 +19,8 @@ services:
       - --advertise-rpc-addr=rp-0:33145
       - --set
       - redpanda.empty_seed_starts_cluster=false
+      - --set
+      - redpanda.crash_loop_limit=100000
       - --default-log-level=info
     ports:
       - "29090:29090"
@@ -47,6 +49,8 @@ services:
       - --advertise-rpc-addr=rp-1:33145
       - --set
       - redpanda.empty_seed_starts_cluster=false
+      - --set
+      - redpanda.crash_loop_limit=100000
       - --default-log-level=info
     ports:
       - "29091:29091"
@@ -75,6 +79,8 @@ services:
       - --advertise-rpc-addr=rp-2:33145
       - --set
       - redpanda.empty_seed_starts_cluster=false
+      - --set
+      - redpanda.crash_loop_limit=100000
       - --default-log-level=info
     ports:
       - "29092:29092"

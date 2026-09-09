@@ -12,7 +12,7 @@
 
 use std::time::{Duration, Instant};
 
-use super::cluster::{Fault, FaultTarget, majority_leaders, views};
+use super::cluster::{Fault, FaultTarget, majority_leaders, views, wait_fully_healthy};
 
 #[derive(Debug)]
 pub struct ProbeRow {
@@ -41,7 +41,7 @@ pub async fn probe<T: FaultTarget>(
     faults: &[Fault],
 ) -> Result<Vec<ProbeRow>, String> {
     target.create_topic(topic, 1, 3).await?;
-    target.wait_healthy(topic, 1, Duration::from_secs(60)).await?;
+    wait_fully_healthy(target, topic, 1, Duration::from_secs(90)).await?;
     // Sanity bound, not a pass/fail target: a fault that produces no leader
     // change inside this window did not do what it claims. Redpanda's
     // follower election after a half-open partition (pause/isolate) runs
@@ -125,7 +125,7 @@ pub async fn probe<T: FaultTarget>(
         // heal and wait for full replication again.
         let th = Instant::now();
         target.heal(victim, fault).await?;
-        let healed_ms = match target.wait_healthy(topic, 1, Duration::from_secs(90)).await {
+        let healed_ms = match wait_fully_healthy(target, topic, 1, Duration::from_secs(120)).await {
             Ok(()) => Some(th.elapsed().as_millis() as u64),
             Err(e) => {
                 notes.push(format!("heal: {e}"));

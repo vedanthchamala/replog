@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use crate::checker::{History, Report};
 use crate::harness::rng::SplitMix64;
 
-use super::cluster::{Fault, FaultTarget};
+use super::cluster::{Fault, FaultTarget, wait_fully_healthy};
 use super::failover::{
     AckClock, FaultOutcome, LeaderWatch, outcome_csv_row, outcomes_csv_header, percentiles,
 };
@@ -49,6 +49,9 @@ pub struct RunConfig {
 pub struct RunSummary {
     pub report: Report,
     pub readers_per_partition: usize,
+    /// Times the cluster failed to re-form within the budget after a heal;
+    /// > 0 means the schedule was cut short (see schedule.log).
+    pub health_incidents: u32,
     pub fault_counts: BTreeMap<&'static str, u32>,
     pub outcomes: Vec<FaultOutcome>,
     pub acked_total: u64,
@@ -95,6 +98,12 @@ impl RunSummary {
             "availability: {} of {} load-seconds had zero acks; {} ids acked in total\n",
             self.zero_ack_seconds, self.load_seconds, self.acked_total
         ));
+        if self.health_incidents > 0 {
+            s.push_str(&format!(
+                "WARNING: cluster failed to re-form after a heal {} time(s); fault injection was cut short (see schedule.log)\n",
+                self.health_incidents
+            ));
+        }
         s.push_str(&format!(
             "duplicates: {} deliveries beyond one per reader per id ({} readers per partition; raw checker count {} includes the extra readers)\n",
             self.extra_duplicates(),
@@ -125,7 +134,7 @@ pub async fn run<T: FaultTarget + 'static, W: Workload>(
     let partitions = cfg.partitions;
 
     target.create_topic(&topic, partitions, cfg.replication).await?;
-    target.wait_healthy(&topic, partitions, Duration::from_secs(60)).await?;
+    wait_fully_healthy(target.as_ref(), &topic, partitions, Duration::from_secs(90)).await?;
 
     let started = Instant::now();
     let history = Arc::new(Mutex::new(History::new()));
@@ -232,6 +241,7 @@ pub async fn run<T: FaultTarget + 'static, W: Workload>(
     let n = target.broker_count();
     let mut fault_counts: BTreeMap<&'static str, u32> = BTreeMap::new();
     let mut outcomes: Vec<FaultOutcome> = Vec::new();
+    let mut health_incidents = 0u32;
     let observe_budget = Duration::from_millis((5 * cfg.detect_ms).max(15_000));
 
     if cfg.faults.is_empty() {
@@ -292,11 +302,24 @@ pub async fn run<T: FaultTarget + 'static, W: Workload>(
             &mut schedule,
             format!("HEAL {} broker {victim}; waiting for full health", fault.name()),
         );
-        target.wait_healthy(&topic, partitions, Duration::from_secs(120)).await?;
-        log_event(
-            &mut schedule,
-            format!("HEALTHY after {} ms", healed_at.elapsed().as_millis()),
-        );
+        let health = wait_fully_healthy(target.as_ref(), &topic, partitions, Duration::from_secs(120)).await;
+        let mut cut_short = false;
+        match health {
+            Ok(()) => log_event(
+                &mut schedule,
+                format!("HEALTHY after {} ms", healed_at.elapsed().as_millis()),
+            ),
+            Err(e) => {
+                // Do not throw the run away: stop injecting faults, keep the
+                // history, and let the checker judge what clients saw. The
+                // schedule log records why the run was cut short.
+                log_event(
+                    &mut schedule,
+                    format!("HEALTH TIMEOUT after heal ({e}); stopping fault injection, run is CUT SHORT"),
+                );
+                cut_short = true;
+            }
+        }
         for p in 0..partitions {
             let moved = watch.first_new_leader_after(t0, p, victim);
             outcomes.push(FaultOutcome {
@@ -311,10 +334,17 @@ pub async fn run<T: FaultTarget + 'static, W: Workload>(
                 first_ack_ms: first_acks[p as usize].map(|t| (t - t0).as_millis() as u64),
             });
         }
+        if cut_short {
+            health_incidents += 1;
+            break;
+        }
     }
 
     log_event(&mut schedule, "schedule done; waiting for full health".into());
-    target.wait_healthy(&topic, partitions, Duration::from_secs(120)).await?;
+    if let Err(e) = wait_fully_healthy(target.as_ref(), &topic, partitions, Duration::from_secs(120)).await {
+        log_event(&mut schedule, format!("HEALTH TIMEOUT at end of schedule ({e}); draining anyway"));
+        health_incidents += 1;
+    }
     let load_seconds = started.elapsed().as_secs() as u32;
     stop_producers_tx.send(true).ok();
     log_event(&mut schedule, "producers stopped; readers draining".into());
@@ -387,6 +417,7 @@ pub async fn run<T: FaultTarget + 'static, W: Workload>(
     Ok(RunSummary {
         report,
         readers_per_partition: cfg.readers_per_partition,
+        health_incidents,
         fault_counts,
         outcomes,
         acked_total,

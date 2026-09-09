@@ -1,0 +1,121 @@
+name: replog-kf
+
+services:
+  kf-0:
+    image: apache/kafka:4.0.0
+    container_name: kf-0
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kf-0:9093,2@kf-1:9093,3@kf-2:9093
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:9092,EXTERNAL://0.0.0.0:39090,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kf-0:9092,EXTERNAL://localhost:39090
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 3
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 3
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 2
+      KAFKA_MIN_INSYNC_REPLICAS: 2
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 3
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_AUTO_LEADER_REBALANCE_ENABLE: "false"
+      KAFKA_UNCLEAN_LEADER_ELECTION_ENABLE: "false"
+      # matched failure detection: broker session (controller-side liveness)
+      # and replica lag (ISR shrink) — same values as the replog target
+      KAFKA_BROKER_HEARTBEAT_INTERVAL_MS: 200
+      KAFKA_BROKER_SESSION_TIMEOUT_MS: ${DETECT_MS:-1000}
+      KAFKA_REPLICA_LAG_TIME_MAX_MS: ${LAG_MS:-1500}
+      KAFKA_LOG_FLUSH_INTERVAL_MESSAGES: 9223372036854775807
+      KAFKA_HEAP_OPTS: -Xmx768m -Xms768m
+      CLUSTER_ID: replog-faults-kraft-cluster
+    ports:
+      - "39090:39090"
+    networks:
+      - edge-0
+      - peers
+    volumes:
+      - kf-0:/var/lib/kafka/data
+
+  kf-1:
+    image: apache/kafka:4.0.0
+    container_name: kf-1
+    environment:
+      KAFKA_NODE_ID: 2
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kf-0:9093,2@kf-1:9093,3@kf-2:9093
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:9092,EXTERNAL://0.0.0.0:39091,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kf-1:9092,EXTERNAL://localhost:39091
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 3
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 3
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 2
+      KAFKA_MIN_INSYNC_REPLICAS: 2
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 3
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_AUTO_LEADER_REBALANCE_ENABLE: "false"
+      KAFKA_UNCLEAN_LEADER_ELECTION_ENABLE: "false"
+      # matched failure detection: broker session (controller-side liveness)
+      # and replica lag (ISR shrink) — same values as the replog target
+      KAFKA_BROKER_HEARTBEAT_INTERVAL_MS: 200
+      KAFKA_BROKER_SESSION_TIMEOUT_MS: ${DETECT_MS:-1000}
+      KAFKA_REPLICA_LAG_TIME_MAX_MS: ${LAG_MS:-1500}
+      KAFKA_LOG_FLUSH_INTERVAL_MESSAGES: 9223372036854775807
+      KAFKA_HEAP_OPTS: -Xmx768m -Xms768m
+      CLUSTER_ID: replog-faults-kraft-cluster
+    ports:
+      - "39091:39091"
+    networks:
+      - edge-1
+      - peers
+    volumes:
+      - kf-1:/var/lib/kafka/data
+
+  kf-2:
+    image: apache/kafka:4.0.0
+    container_name: kf-2
+    environment:
+      KAFKA_NODE_ID: 3
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kf-0:9093,2@kf-1:9093,3@kf-2:9093
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:9092,EXTERNAL://0.0.0.0:39092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kf-2:9092,EXTERNAL://localhost:39092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 3
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 3
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 2
+      KAFKA_MIN_INSYNC_REPLICAS: 2
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 3
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_AUTO_LEADER_REBALANCE_ENABLE: "false"
+      KAFKA_UNCLEAN_LEADER_ELECTION_ENABLE: "false"
+      # matched failure detection: broker session (controller-side liveness)
+      # and replica lag (ISR shrink) — same values as the replog target
+      KAFKA_BROKER_HEARTBEAT_INTERVAL_MS: 200
+      KAFKA_BROKER_SESSION_TIMEOUT_MS: ${DETECT_MS:-1000}
+      KAFKA_REPLICA_LAG_TIME_MAX_MS: ${LAG_MS:-1500}
+      KAFKA_LOG_FLUSH_INTERVAL_MESSAGES: 9223372036854775807
+      KAFKA_HEAP_OPTS: -Xmx768m -Xms768m
+      CLUSTER_ID: replog-faults-kraft-cluster
+    ports:
+      - "39092:39092"
+    networks:
+      - edge-2
+      - peers
+    volumes:
+      - kf-2:/var/lib/kafka/data
+
+networks:
+  peers: {}
+  edge-0: {}
+  edge-1: {}
+  edge-2: {}
+
+volumes:
+  kf-0: {}
+  kf-1: {}
+  kf-2: {}

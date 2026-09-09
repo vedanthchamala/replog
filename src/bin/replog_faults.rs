@@ -50,7 +50,16 @@ pub fn preset(name: &str) -> Result<Preset, String> {
             admin_addrs: vec!["localhost:29099".into()],
             node_ids: vec![0, 1, 2],
         }),
-        other => Err(format!("unknown target {other:?} (redpanda|replog)")),
+        "kafka" => Ok(Preset {
+            name: "kafka",
+            containers: (0..3).map(|i| format!("kf-{i}")).collect(),
+            peers_network: "replog-kf_peers".into(),
+            client_addrs: (0..3).map(|i| format!("localhost:{}", 39090 + i)).collect(),
+            // No admin API: health comes from every broker's own metadata view.
+            admin_addrs: Vec::new(),
+            node_ids: vec![1, 2, 3],
+        }),
+        other => Err(format!("unknown target {other:?} (redpanda|replog|kafka)")),
     }
 }
 
@@ -114,7 +123,15 @@ fn run_config(args: &[String]) -> Result<RunConfig, String> {
     let seed = num(args, "--seed", 1)?;
     let target = arg_value(args, "--target").ok_or("--target is required")?;
     Ok(RunConfig {
-        topic: arg_value(args, "--topic").unwrap_or(format!("torture-{seed}")),
+        // Fresh topic per run: reusing one would let readers see a previous
+        // run's records (same id space) and corrupt the duplicate count.
+        topic: arg_value(args, "--topic").unwrap_or_else(|| {
+            let secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() % 1_000_000)
+                .unwrap_or(0);
+            format!("t{seed}-{secs}")
+        }),
         partitions: num(args, "--partitions", 2)? as u32,
         replication: 3,
         seed,
