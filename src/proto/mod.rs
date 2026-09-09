@@ -147,7 +147,12 @@ pub struct TopicMeta {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ClusterMeta {
     pub version: u64,
+    /// Client-facing address per broker.
     pub brokers: Vec<(u32, String)>,
+    /// Inter-broker address per broker (follower fetch, epoch checks). Equal
+    /// to the client address unless the broker advertises a separate one —
+    /// containers with a private peers network do.
+    pub peers: Vec<(u32, String)>,
     pub topics: Vec<TopicMeta>,
 }
 
@@ -155,6 +160,11 @@ fn put_cluster_meta(out: &mut Vec<u8>, meta: &ClusterMeta) {
     wire::put_u64(out, meta.version);
     wire::put_u32(out, meta.brokers.len() as u32);
     for (id, addr) in &meta.brokers {
+        wire::put_u32(out, *id);
+        wire::put_str(out, addr);
+    }
+    wire::put_u32(out, meta.peers.len() as u32);
+    for (id, addr) in &meta.peers {
         wire::put_u32(out, *id);
         wire::put_str(out, addr);
     }
@@ -184,6 +194,11 @@ fn read_cluster_meta(r: &mut wire::Reader<'_>) -> Result<ClusterMeta> {
     let mut brokers = Vec::new();
     for _ in 0..broker_count {
         brokers.push((r.u32()?, r.string()?));
+    }
+    let peer_count = r.u32()?;
+    let mut peers = Vec::new();
+    for _ in 0..peer_count {
+        peers.push((r.u32()?, r.string()?));
     }
     let topic_count = r.u32()?;
     let mut topics = Vec::new();
@@ -218,6 +233,7 @@ fn read_cluster_meta(r: &mut wire::Reader<'_>) -> Result<ClusterMeta> {
     Ok(ClusterMeta {
         version,
         brokers,
+        peers,
         topics,
     })
 }
@@ -279,7 +295,10 @@ pub enum Request {
     },
     RegisterBroker {
         broker_id: u32,
+        /// Where clients should dial this broker.
         addr: String,
+        /// Where other brokers should dial it (same as `addr` by default).
+        peer_addr: String,
     },
     BrokerHeartbeat {
         broker_id: u32,
@@ -472,10 +491,15 @@ pub fn encode_request(req: &Request, correlation_id: u32) -> Vec<u8> {
             wire::put_u32(&mut out, *partition);
             wire::put_u64(&mut out, *epoch);
         }
-        Request::RegisterBroker { broker_id, addr } => {
+        Request::RegisterBroker {
+            broker_id,
+            addr,
+            peer_addr,
+        } => {
             frame_header(&mut out, MSG_REGISTER_BROKER, correlation_id);
             wire::put_u32(&mut out, *broker_id);
             wire::put_str(&mut out, addr);
+            wire::put_str(&mut out, peer_addr);
         }
         Request::BrokerHeartbeat {
             broker_id,
@@ -767,6 +791,7 @@ pub fn decode_request(frame: &[u8]) -> Result<(u32, Request)> {
         MSG_REGISTER_BROKER => Request::RegisterBroker {
             broker_id: r.u32()?,
             addr: r.string()?,
+            peer_addr: r.string()?,
         },
         MSG_BROKER_HEARTBEAT => Request::BrokerHeartbeat {
             broker_id: r.u32()?,
@@ -1044,6 +1069,7 @@ mod tests {
         roundtrip_request(Request::RegisterBroker {
             broker_id: 2,
             addr: "127.0.0.1:9202".into(),
+            peer_addr: "127.0.0.1:9202".into(),
         });
         roundtrip_request(Request::BrokerHeartbeat {
             broker_id: 2,
@@ -1101,6 +1127,7 @@ mod tests {
         let cluster = ClusterMeta {
             version: 12,
             brokers: vec![(0, "127.0.0.1:9200".into()), (1, "127.0.0.1:9201".into())],
+            peers: vec![(0, "broker-0:9000".into()), (1, "broker-1:9000".into())],
             topics: vec![TopicMeta {
                 name: "orders".into(),
                 partitions: vec![

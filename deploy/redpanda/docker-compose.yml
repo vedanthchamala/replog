@@ -1,0 +1,97 @@
+name: replog-rp
+
+services:
+  rp-0:
+    image: docker.redpanda.com/redpandadata/redpanda:v26.2.2
+    container_name: rp-0
+    entrypoint: ["/bin/bash", "-c", "rpk redpanda config set redpanda.developer_mode false && exec rpk redpanda start \"$@\"", "--"]
+    command:
+      - --smp=1
+      - --memory=1G
+      - --reserve-memory=0M
+      - --overprovisioned
+      - --check=false
+      - --node-id=0
+      - --seeds=rp-0:33145,rp-1:33145,rp-2:33145
+      - --kafka-addr=internal://0.0.0.0:9092,external://0.0.0.0:29090
+      - --advertise-kafka-addr=internal://rp-0:9092,external://localhost:29090
+      - --rpc-addr=0.0.0.0:33145
+      - --advertise-rpc-addr=rp-0:33145
+      - --set
+      - redpanda.empty_seed_starts_cluster=false
+      - --default-log-level=info
+    ports:
+      - "29090:29090"
+      - "29640:9644"
+    networks:
+      - edge-0
+      - peers
+    volumes:
+      - rp-0:/var/lib/redpanda/data
+
+  rp-1:
+    image: docker.redpanda.com/redpandadata/redpanda:v26.2.2
+    container_name: rp-1
+    entrypoint: ["/bin/bash", "-c", "rpk redpanda config set redpanda.developer_mode false && exec rpk redpanda start \"$@\"", "--"]
+    command:
+      - --smp=1
+      - --memory=1G
+      - --reserve-memory=0M
+      - --overprovisioned
+      - --check=false
+      - --node-id=1
+      - --seeds=rp-0:33145,rp-1:33145,rp-2:33145
+      - --kafka-addr=internal://0.0.0.0:9092,external://0.0.0.0:29091
+      - --advertise-kafka-addr=internal://rp-1:9092,external://localhost:29091
+      - --rpc-addr=0.0.0.0:33145
+      - --advertise-rpc-addr=rp-1:33145
+      - --set
+      - redpanda.empty_seed_starts_cluster=false
+      - --default-log-level=info
+    ports:
+      - "29091:29091"
+      - "29641:9644"
+    networks:
+      - edge-1
+      - peers
+    volumes:
+      - rp-1:/var/lib/redpanda/data
+
+  rp-2:
+    image: docker.redpanda.com/redpandadata/redpanda:v26.2.2
+    container_name: rp-2
+    entrypoint: ["/bin/bash", "-c", "rpk redpanda config set redpanda.developer_mode false && exec rpk redpanda start \"$@\"", "--"]
+    command:
+      - --smp=1
+      - --memory=1G
+      - --reserve-memory=0M
+      - --overprovisioned
+      - --check=false
+      - --node-id=2
+      - --seeds=rp-0:33145,rp-1:33145,rp-2:33145
+      - --kafka-addr=internal://0.0.0.0:9092,external://0.0.0.0:29092
+      - --advertise-kafka-addr=internal://rp-2:9092,external://localhost:29092
+      - --rpc-addr=0.0.0.0:33145
+      - --advertise-rpc-addr=rp-2:33145
+      - --set
+      - redpanda.empty_seed_starts_cluster=false
+      - --default-log-level=info
+    ports:
+      - "29092:29092"
+      - "29642:9644"
+    networks:
+      - edge-2
+      - peers
+    volumes:
+      - rp-2:/var/lib/redpanda/data
+
+networks:
+  peers: {}
+  edge-0: {}
+  edge-1: {}
+  edge-2: {}
+
+volumes:
+  rp-0: {}
+  rp-1: {}
+  rp-2: {}

@@ -8,10 +8,14 @@ license = "MIT"
 [dependencies]
 crc32fast = "1"
 thiserror = "2"
-tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "time", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "time", "macros", "process"] }
+rdkafka = { version = "0.39", features = ["cmake-build", "tokio"], optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"
+
+[features]
+kafka = ["rdkafka"]
 
 [dev-dependencies]
 tempfile = "3"

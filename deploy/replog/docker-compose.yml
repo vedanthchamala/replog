@@ -1,0 +1,131 @@
+name: replog-rl
+
+services:
+  rl-ctl:
+    image: replog:latest
+    container_name: rl-ctl
+    command:
+      - replog_controller
+      - --listen
+      - "0.0.0.0:9099"
+      - --state-file
+      - "/data/controller.state"
+      - --session-timeout-ms
+      - "${DETECT_MS:-1000}"
+    ports:
+      - "29099:9099"
+    networks:
+      - peers
+    volumes:
+      - rl-ctl:/data
+
+  rl-0:
+    image: replog:latest
+    container_name: rl-0
+    command:
+      - replog_broker
+      - --listen
+      - "0.0.0.0:9000"
+      - --advertise-addr
+      - "localhost:29000"
+      - --advertise-peer-addr
+      - "rl-0:9000"
+      - --controller-addr
+      - "rl-ctl:9099"
+      - --broker-id
+      - "0"
+      - --data-dir
+      - "/data"
+      - --fsync
+      - "batch:1048576:5"
+      - --min-isr
+      - "2"
+      - --replica-lag-ms
+      - "${LAG_MS:-1500}"
+    ports:
+      - "29000:9000"
+    networks:
+      - edge-0
+      - peers
+    volumes:
+      - rl-0:/data
+    depends_on:
+      - rl-ctl
+
+  rl-1:
+    image: replog:latest
+    container_name: rl-1
+    command:
+      - replog_broker
+      - --listen
+      - "0.0.0.0:9000"
+      - --advertise-addr
+      - "localhost:29001"
+      - --advertise-peer-addr
+      - "rl-1:9000"
+      - --controller-addr
+      - "rl-ctl:9099"
+      - --broker-id
+      - "1"
+      - --data-dir
+      - "/data"
+      - --fsync
+      - "batch:1048576:5"
+      - --min-isr
+      - "2"
+      - --replica-lag-ms
+      - "${LAG_MS:-1500}"
+    ports:
+      - "29001:9000"
+    networks:
+      - edge-1
+      - peers
+    volumes:
+      - rl-1:/data
+    depends_on:
+      - rl-ctl
+
+  rl-2:
+    image: replog:latest
+    container_name: rl-2
+    command:
+      - replog_broker
+      - --listen
+      - "0.0.0.0:9000"
+      - --advertise-addr
+      - "localhost:29002"
+      - --advertise-peer-addr
+      - "rl-2:9000"
+      - --controller-addr
+      - "rl-ctl:9099"
+      - --broker-id
+      - "2"
+      - --data-dir
+      - "/data"
+      - --fsync
+      - "batch:1048576:5"
+      - --min-isr
+      - "2"
+      - --replica-lag-ms
+      - "${LAG_MS:-1500}"
+    ports:
+      - "29002:9000"
+    networks:
+      - edge-2
+      - peers
+    volumes:
+      - rl-2:/data
+    depends_on:
+      - rl-ctl
+
+networks:
+  peers: {}
+  edge-0: {}
+  edge-1: {}
+  edge-2: {}
+
+volumes:
+  rl-ctl: {}
+  rl-0: {}
+  rl-1: {}
+  rl-2: {}

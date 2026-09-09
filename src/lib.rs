@@ -11,3 +11,4 @@ pub mod client;
 pub mod harness;
 pub mod proto;
 pub mod storage;
+pub mod torture;

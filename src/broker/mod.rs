@@ -56,8 +56,12 @@ pub struct BrokerConfig {
     pub broker_id: u32,
     /// None = standalone (Stage 2/3 behavior: this broker is the world).
     pub controller_addr: Option<String>,
-    /// Address other brokers/clients should dial; defaults to the bound one.
+    /// Address clients should dial; defaults to the bound one.
     pub advertise_addr: Option<String>,
+    /// Address other brokers should dial (follower fetch, epoch checks);
+    /// defaults to `advertise_addr`. Separate when peers live on a private
+    /// network and clients arrive through a published port.
+    pub advertise_peer_addr: Option<String>,
     /// acks=all is refused when the ISR is smaller than this.
     pub min_insync_replicas: u32,
     /// A follower silent for this long is proposed out of the ISR.
@@ -72,6 +76,7 @@ impl BrokerConfig {
             broker_id: 0,
             controller_addr: None,
             advertise_addr: None,
+            advertise_peer_addr: None,
             min_insync_replicas: 2,
             replica_lag_ms: 2000,
         }
@@ -459,6 +464,7 @@ impl Shared {
         ClusterMeta {
             version: 0,
             brokers: vec![(0, self.advertised.clone())],
+            peers: vec![(0, self.advertised.clone())],
             topics,
         }
     }
@@ -506,10 +512,16 @@ async fn cluster_runtime(shared: Arc<Shared>, mut shutdown: watch::Receiver<bool
                 .advertise_addr
                 .clone()
                 .unwrap_or_else(|| shared.advertised.clone());
+            let peer_addr = shared
+                .config
+                .advertise_peer_addr
+                .clone()
+                .unwrap_or_else(|| advertise.clone());
             match conn
                 .call(&Request::RegisterBroker {
                     broker_id: shared.config.broker_id,
                     addr: advertise,
+                    peer_addr,
                 })
                 .await
             {
@@ -628,8 +640,9 @@ async fn apply_metadata(shared: &Arc<Shared>, meta: &crate::proto::ClusterMeta) 
                 replica.advance_hwm(self_id);
             } else if p.leader >= 0 {
                 let leader_addr = meta
-                    .brokers
+                    .peers
                     .iter()
+                    .chain(meta.brokers.iter())
                     .find(|(id, _)| *id == p.leader as u32)
                     .map(|(_, addr)| addr.clone());
                 if let Some(addr) = leader_addr {

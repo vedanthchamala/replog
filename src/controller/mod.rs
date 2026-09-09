@@ -22,7 +22,7 @@ use crate::proto::{
 };
 use crate::storage::fsync_file;
 
-const SNAPSHOT_MAGIC: u32 = 0x524C_4354; // "RLCT"
+const SNAPSHOT_MAGIC: u32 = 0x524C_4332; // "RLC2": v2 adds the peer address per broker
 
 #[derive(Debug, Clone)]
 pub struct ControllerConfig {
@@ -33,6 +33,7 @@ pub struct ControllerConfig {
 
 struct BrokerState {
     addr: String,
+    peer_addr: String,
     alive: bool,
     last_heartbeat: Instant,
 }
@@ -174,15 +175,21 @@ async fn serve_connection(
 impl Shared {
     fn handle(&self, req: Request) -> Response {
         match req {
-            Request::RegisterBroker { broker_id, addr } => {
+            Request::RegisterBroker {
+                broker_id,
+                addr,
+                peer_addr,
+            } => {
                 let version = self.mutate(|state| {
                     let entry = state.brokers.entry(broker_id).or_insert(BrokerState {
                         addr: addr.clone(),
+                        peer_addr: peer_addr.clone(),
                         alive: false,
                         last_heartbeat: Instant::now(),
                     });
-                    let changed = !entry.alive || entry.addr != addr;
+                    let changed = !entry.alive || entry.addr != addr || entry.peer_addr != peer_addr;
                     entry.addr = addr;
+                    entry.peer_addr = peer_addr;
                     entry.alive = true;
                     entry.last_heartbeat = Instant::now();
                     let elected = elect_where_needed(state);
@@ -345,6 +352,12 @@ impl Shared {
             .map(|(id, b)| (*id, b.addr.clone()))
             .collect();
         brokers.sort();
+        let mut peers: Vec<(u32, String)> = state
+            .brokers
+            .iter()
+            .map(|(id, b)| (*id, b.peer_addr.clone()))
+            .collect();
+        peers.sort();
         let mut topics: Vec<TopicMeta> = state
             .topics
             .iter()
@@ -367,6 +380,7 @@ impl Shared {
         ClusterMeta {
             version: state.version,
             brokers,
+            peers,
             topics,
         }
     }
@@ -420,6 +434,7 @@ fn persist_snapshot(path: &PathBuf, state: &State) -> std::io::Result<()> {
     for id in broker_ids {
         wire::put_u32(&mut buf, *id);
         wire::put_str(&mut buf, &state.brokers[id].addr);
+        wire::put_str(&mut buf, &state.brokers[id].peer_addr);
     }
     wire::put_u32(&mut buf, state.topics.len() as u32);
     let mut names: Vec<&String> = state.topics.keys().collect();
@@ -475,10 +490,12 @@ fn load_snapshot(path: &PathBuf) -> std::io::Result<State> {
         for _ in 0..broker_count {
             let id = r.u32()?;
             let addr = r.string()?;
+            let peer_addr = r.string()?;
             brokers.insert(
                 id,
                 BrokerState {
                     addr,
+                    peer_addr,
                     // Nobody is trusted as alive until they heartbeat again.
                     alive: false,
                     last_heartbeat: Instant::now(),

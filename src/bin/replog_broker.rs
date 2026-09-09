@@ -20,6 +20,7 @@ fn parse_args() -> Result<(String, BrokerConfig), String> {
     let mut broker_id = 0u32;
     let mut controller_addr = None;
     let mut advertise_addr = None;
+    let mut advertise_peer_addr = None;
     let mut min_isr = 2u32;
     let mut replica_lag_ms = None;
     let mut it = std::env::args().skip(1);
@@ -40,6 +41,10 @@ fn parse_args() -> Result<(String, BrokerConfig), String> {
             }
             "--advertise-addr" => {
                 advertise_addr = Some(it.next().ok_or("--advertise-addr needs a value")?)
+            }
+            "--advertise-peer-addr" => {
+                advertise_peer_addr =
+                    Some(it.next().ok_or("--advertise-peer-addr needs a value")?)
             }
             "--min-isr" => {
                 min_isr = it
@@ -68,6 +73,7 @@ fn parse_args() -> Result<(String, BrokerConfig), String> {
     config.broker_id = broker_id;
     config.controller_addr = controller_addr;
     config.advertise_addr = advertise_addr;
+    config.advertise_peer_addr = advertise_peer_addr;
     config.min_insync_replicas = min_isr;
     if let Some(ms) = replica_lag_ms {
         config.replica_lag_ms = ms;
