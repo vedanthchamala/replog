@@ -105,10 +105,11 @@ uv run bench/plot_cluster.py
 Stages 1–5 proved replog's durability contract, but the harness could only ever
 judge replog. Stage 6 splits it into a **fault backend**, a **target**, and a
 **workload adapter**, with the seeded schedule and offline checker held
-constant, then runs replog and Redpanda under *identical seeded fault schedules,
-in identical containers, with the same 1000 ms failure-detection timeout* and
-compares what clients observed. The fault vocabulary is Docker-level and the
-same for both: `kill` (SIGKILL + restart), `pause` (cgroup freezer — sockets
+constant, then runs replog, Redpanda, and Apache Kafka (KRaft) under *identical
+seeded fault schedules, in identical containers, with the same 1000 ms
+failure-detection timeout* and compares what clients observed. The fault
+vocabulary is Docker-level and the same for every target: `kill` (SIGKILL +
+restart), `pause` (cgroup freezer — sockets
 open, nothing progresses), and `isolate` (drop the broker off the peers network
 while the host still reaches it — a live zombie leader on the data path). One
 private edge network per broker keeps `isolate` from being silently defeated by
@@ -117,9 +118,11 @@ Docker's DNS.
 ```
 deploy/redpanda/up.sh              # 3-broker Redpanda (dev-mode off: fsync on, caching off)
 deploy/replog/up.sh                # replog: 1 controller + 3 brokers, matched timeout
+deploy/kafka/up.sh                 # 3-node Apache Kafka (KRaft), matched timeout
 cargo build --release --features kafka --bin replog_faults
 bench/run_faults.sh redpanda       # probe → baseline → sensitivity controls → 3 seeds
 bench/run_faults.sh replog
+bench/run_faults.sh kafka
 uv run bench/plot_faults.py         # comparison tables + ECDFs
 uv run bench/plot_recovery.py       # recovery-vs-downtime scatter
 ```
@@ -129,37 +132,40 @@ matrix starts with a `probe` that asserts each fault does what it claims (the
 leader moves, the victim's port refuses / hangs / keeps serving as predicted,
 the cluster re-forms), then a sensitivity control: the *same* isolate-only
 schedule at `acks=1` versus `acks=all`. At `acks=1` the checker catches the
-zombie-leader loss on both systems (Redpanda **1,185** acked ids never
-readable, replog **5,875**); at `acks=all` on the same seed, **zero** on both.
-A checker that never fails is not evidence.
+zombie-leader loss on all three systems (Redpanda **1,185** acked ids never
+readable, Kafka **2,515**, replog **5,875**); at `acks=all` on the same seed,
+**zero** on all three. A checker that never fails is not evidence.
 
-**The contract holds on both.** Three 120 s seeds each, `kill`/`pause`/`isolate`
-mixed, `acks=all`: **zero contract violations** on Redpanda (95k acked ids) and
-replog (75k), duplicates counted honestly. What differs is *availability*, and
-the differences are the ISR-vs-Raft design choice made measurable:
+**The contract holds on all three.** Three 120 s seeds each,
+`kill`/`pause`/`isolate` mixed, `acks=all`: **zero contract violations** on
+Redpanda, Apache Kafka (KRaft), and replog, duplicates counted honestly. What
+differs is *availability*, and running two production systems beside replog
+separates a design trade-off from an implementation defect:
 
-| what a fault costs `acks=all`, p50 | replog (ISR) | Redpanda (Raft) |
-|---|---|---|
-| a **follower** dying (leader stays up) | **1.7 s** stall | **~50 ms** |
-| leadership moving to a new leader | **0.9–2.0 s** | 3.4–6.6 s |
-| **recovery** after a leader `kill`, broker down 4 s | ~7 s | ~4 s |
-| **recovery** after a leader `kill`, broker down 12 s | **~15 s** | **~4–6 s** |
+| what a fault costs `acks=all`, p50 | replog (ISR) | Kafka (ISR) | Redpanda (Raft) |
+|---|---|---|---|
+| a **follower** dying (leader stays up) | **1.7 s** | **~1.5 s** | **~50 ms** |
+| leadership moving to a new leader | 0.9–2.0 s | 1–3 s | 3.4–6.6 s |
+| **recovery** after a leader `kill`, broker down 12 s | **~15 s** | **~2 s** | **~4–6 s** |
 
 Two findings the tool surfaced, neither of which touches the durability contract
-(both systems lost zero acked records throughout):
+(all three lost zero acked records throughout):
 
-- **ISR waits for the slowest replica; quorum waits for the majority.** A single
-  follower death stalls replog's `acks=all` for ~1.7 s — the high-water mark is
-  gated on the silent follower until the replica-lag window (1.5 s) expires and
-  the leader shrinks it out. Redpanda commits on a majority (2 of 3) and barely
-  registers the same fault (~50 ms). This is precisely the trade-off ISR makes,
-  now a number rather than a claim.
-- **replog's `acks=all` leader-failover recovery scales with broker downtime;
-  Redpanda's does not.** replog *detects* and re-elects faster (leadership moves
-  in under a second, vs several seconds of Raft pre-vote/vote), but the killed
-  partition then stays unavailable for the entire time the broker is down plus
-  ~3 s: with a 12 s downtime the ack gap is ~15 s, versus Redpanda's ~4–6 s
-  independent of downtime (`bench/results/faults/recovery_vs_downtime.png`).
+- **ISR waits for the slowest replica; quorum waits for the majority — and
+  replog matches Kafka.** A single follower death stalls `acks=all` for ~1.7 s on
+  replog and ~1.5 s on Apache Kafka: both are ISR designs whose high-water mark is
+  gated on the silent follower until the replica-lag window (1.5 s) shrinks it
+  out. Redpanda commits on a Raft majority (2 of 3) and barely registers the same
+  fault (~50 ms). The trade-off ISR makes, as a number — and replog's ISR behaving
+  like the real one is the point.
+- **replog's leader-failover recovery scales with broker downtime; both
+  production systems' do not — so this is replog's bug, not ISR's.** replog
+  *detects* and re-elects fastest (leadership moves in under a second), but the
+  killed partition then stays unavailable for the whole downtime plus ~3 s: at 12 s
+  downtime the ack gap is ~15 s, while Kafka (also ISR) recovers in ~2 s and
+  Redpanda in ~4–6 s, both independent of downtime
+  (`bench/results/faults/recovery_vs_downtime.png`). That Kafka is ISR and does
+  *not* have the defect localizes it precisely to replog's election path.
   Traced to the new leader's ISR briefly re-admitting the dead old leader (the
   caught-up-recency grace window counts a never-fetched replica as in-sync from
   the moment of election), which gates the high-water mark on a dead broker's

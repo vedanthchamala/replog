@@ -1,0 +1,11 @@
+fault,victim,t0_s,cli_ms,heal_after_ms,partition,role,leader_moved_ms,new_leader,first_ack_ms,max_gap_ms
+isolate,0,2.372,81,5346,0,leader,1444,1,5,1028
+isolate,0,2.372,81,5346,1,follower,,-1,5,40
+isolate,0,17.853,78,4798,0,follower,,-1,2,37
+isolate,0,17.853,78,4798,1,follower,,-1,1,37
+isolate,2,26.763,97,5083,0,follower,,-1,10,38
+isolate,2,26.763,97,5083,1,follower,,-1,11,37
+isolate,1,35.640,87,5190,0,leader,3322,0,1,40
+isolate,1,35.640,87,5190,1,leader,3322,2,1,40
+isolate,2,54.695,103,3797,0,follower,,-1,16,40
+isolate,2,54.695,103,3797,1,leader,2876,0,16,40

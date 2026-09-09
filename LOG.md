@@ -443,3 +443,28 @@ judges it); a fresh topic per run (reuse let readers see a prior run's ids); and
 
 43 tests green (the two-advertised-address change touched proto/controller/broker
 and left every Stage 2–5 test passing).
+
+## 2026-09-09 (later) — third target: Apache Kafka (KRaft), and the defect gets localized
+
+Ran the same matrix against a 3-node Apache Kafka 4.0 KRaft cluster
+(`deploy/kafka/`, `bench/run_faults.sh kafka`) at the matched 1000 ms timeout.
+Zero contract violations across the three seeds; the acks=1 sensitivity control
+loses 2,515 acked ids under leader isolation (vs 0 at acks=all) — the checker
+fails on demand on Kafka too.
+
+The three-way comparison sharpened both findings:
+- **Follower death: replog ~1.7 s ≈ Kafka ~1.5 s, both >> Redpanda ~50 ms.** Both
+  ISR designs stall until the replica-lag window shrinks the silent follower;
+  Redpanda's Raft commits on a majority and barely notices. replog's ISR behaving
+  like Apache Kafka's is a validation, not a bug.
+- **Leader-failover recovery vs downtime: replog scales (~15 s at heal 12 s),
+  Kafka is flat (~2 s), Redpanda flat (~4–6 s).** Kafka is ISR *and* recovers on
+  election, so replog's downtime-scaling recovery is NOT inherent to ISR — it is a
+  replog-specific defect in the new-leader path (the dead old leader is re-admitted
+  to the in-sync set and gates the high-water mark). The third system is what turns
+  "an ISR trade-off" into "my bug." Durability holds throughout on all three.
+
+Kafka is wired the same way as the others (the rdkafka workload adapter and the
+hand-rolled Kafka metadata client already spoke its protocol; only a preset +
+compose were new). `bench/results/faults/` now holds all three targets;
+`recovery_vs_downtime.png` shows the three curves.

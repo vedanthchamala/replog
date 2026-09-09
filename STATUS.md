@@ -7,11 +7,13 @@
 target-agnostic fault-injection tool (Docker kill/pause/isolate backend,
 rdkafka + replog workload adapters, seeded schedule + offline checker held
 constant). replog and Redpanda run identical seeded schedules in identical
-containers at a matched 1000 ms detection timeout; both hold the contract
-(zero acked loss), and the harness surfaced a real availability defect in
-replog's own acks=all leader-failover path (see below). Apache Kafka target
-is wired (preset + compose) but not yet exercised.
-**Last updated:** 2026-09-08
+containers at a matched 1000 ms detection timeout. All THREE targets —
+replog, Redpanda, and Apache Kafka (KRaft) — hold the contract (zero acked
+loss); the harness surfaced a real availability defect in replog's own
+acks=all leader-failover path, and running Kafka (also ISR) localized it as
+a replog-specific bug rather than an ISR trade-off (Kafka recovers on
+election; replog waits for the killed broker to rejoin).
+**Last updated:** 2026-09-09
 
 ## Done
 
@@ -73,9 +75,7 @@ is wired (preset + compose) but not yet exercised.
    known liveness). Durability is unaffected (checker-clean); this is
    availability. Re-run `bench/run_faults.sh replog` and confirm the
    recovery-vs-downtime line flattens toward Redpanda's.
-2. Exercise the Apache Kafka KRaft target (`deploy/kafka/up.sh`, preset already
-   in `replog_faults`) for the three-way ISR-lite / ISR / Raft table.
-3. Longer torture soaks anytime (Stage 5 harness): `SOAK_SECS=14400 bench/run_torture.sh`.
+2. Longer torture soaks anytime (Stage 5 harness): `SOAK_SECS=14400 bench/run_torture.sh`.
 4. Remaining Stage 6-stretch ideas if desired: idempotent producer, compaction,
    sendfile zero-copy, GCP cross-zone numbers.
 

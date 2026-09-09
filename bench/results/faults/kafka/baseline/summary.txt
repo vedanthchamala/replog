@@ -1,0 +1,6 @@
+checker: 8775 acked, 17550 consumed (8775 distinct), 8775 duplicate deliveries
+  at-least-once: OK
+
+fault    role      n   leader moved (min/p50/p90/max ms)   largest ack gap in fault window (min/p50/p90/max ms)
+availability: 0 of 30 load-seconds had zero acks; 8775 ids acked in total
+duplicates: 0 deliveries beyond one per reader per id (2 readers per partition; raw checker count 8775 includes the extra readers)

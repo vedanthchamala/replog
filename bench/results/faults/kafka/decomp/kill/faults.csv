@@ -1,0 +1,7 @@
+fault,victim,t0_s,cli_ms,heal_after_ms,partition,role,leader_moved_ms,new_leader,first_ack_ms,max_gap_ms
+kill,1,9.739,271,12090,0,leader,1169,2,2229,2497
+kill,1,9.739,271,12090,1,follower,,-1,1223,1490
+kill,2,35.527,270,11545,0,leader,957,1,1756,2007
+kill,2,35.527,270,11545,1,leader,957,0,1757,1686
+kill,1,60.042,259,12237,0,leader,1011,2,1758,2024
+kill,1,60.042,259,12237,1,follower,,-1,1752,991
