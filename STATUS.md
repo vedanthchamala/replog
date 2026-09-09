@@ -3,10 +3,15 @@
 > Session pickup file. Read SPEC.md → PLAN.md → this file → LOG.md (latest entry) at
 > the start of every session, before touching code.
 
-**Stage:** 5 COMPLETE — SPEC Stages 0–5 all delivered; project core DONE.
-Stage 6 (idempotent producer / compaction / sendfile / GCP) is the optional
-stretch tier, unstarted.
-**Last updated:** 2026-08-14
+**Stage:** 6 CORE DELIVERED — the torture harness is now a cross-system,
+target-agnostic fault-injection tool (Docker kill/pause/isolate backend,
+rdkafka + replog workload adapters, seeded schedule + offline checker held
+constant). replog and Redpanda run identical seeded schedules in identical
+containers at a matched 1000 ms detection timeout; both hold the contract
+(zero acked loss), and the harness surfaced a real availability defect in
+replog's own acks=all leader-failover path (see below). Apache Kafka target
+is wired (preset + compose) but not yet exercised.
+**Last updated:** 2026-09-08
 
 ## Done
 
@@ -54,16 +59,40 @@ stretch tier, unstarted.
 
 ## In progress
 
-- Nothing. Project core (SPEC Stages 0–5) is done.
+- Nothing mid-edit. Stage 6 core is committed; working tree builds, 43 tests green.
 
-## Next actions (only if the project is picked up again)
+## Next actions (in priority order)
 
-1. Stage 6 stretch, pick by interest/measurements: idempotent producer
-   (producer id + sequence dedup → exactly-once), `__offsets`/log compaction,
-   sendfile zero-copy fetch, or a 3× GCP e2 deployment (real-network numbers
-   for the replication tax and failover — the two caveats that most want
-   cross-machine data).
-2. Longer soaks anytime: `SOAK_SECS=14400 bench/run_torture.sh`.
+1. **Fix the failover availability defect the harness found** (the standout item).
+   replog's acks=all recovery after a leader `kill` scales with broker downtime
+   (heal 12 s → ~15 s ack gap) because a newly-elected leader re-admits the
+   *dead* old leader to the ISR via the caught-up-recency grace window, gating
+   the HWM on a dead broker's frozen offset. Fix: on a follower→leader
+   transition, do not extend the in-sync grace to a replica the controller has
+   marked down (or seed `match_offsets`/`leader_since` per replica from its last
+   known liveness). Durability is unaffected (checker-clean); this is
+   availability. Re-run `bench/run_faults.sh replog` and confirm the
+   recovery-vs-downtime line flattens toward Redpanda's.
+2. Exercise the Apache Kafka KRaft target (`deploy/kafka/up.sh`, preset already
+   in `replog_faults`) for the three-way ISR-lite / ISR / Raft table.
+3. Longer torture soaks anytime (Stage 5 harness): `SOAK_SECS=14400 bench/run_torture.sh`.
+4. Remaining Stage 6-stretch ideas if desired: idempotent producer, compaction,
+   sendfile zero-copy, GCP cross-zone numbers.
+
+## Stage 6 how-to (so a fresh session can reproduce)
+
+- Bring up targets: `deploy/redpanda/up.sh` and `NO_BUILD=1 deploy/replog/up.sh`
+  (first replog run needs the image: `deploy/replog/up.sh` builds it). Both use a
+  shared `peers` network + one `edge-N` network per broker.
+- Run the matrix: `bench/run_faults.sh <redpanda|replog> [seeds...]` — probe,
+  baseline, acks=1/acks=all controls, then the seeds. Results in
+  `bench/results/faults/<target>/` (history.txt is git-ignored; csvs/logs/
+  summaries/plots are kept).
+- If a run is interrupted mid-fault: `deploy/heal.sh <target>` restores
+  running/unpaused/attached containers.
+- Plots: `uv run bench/plot_faults.py` (tables + ECDFs), `uv run
+  bench/plot_recovery.py` (recovery-vs-downtime).
+- The `kafka` feature is required: `cargo build --release --features kafka`.
 
 ## Standing rules for any session (any model)
 

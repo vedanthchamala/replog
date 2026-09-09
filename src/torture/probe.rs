@@ -57,8 +57,10 @@ pub async fn probe<T: FaultTarget>(
         let victim = victim as usize;
         let mut notes = Vec::new();
         eprintln!("[probe] {} → broker {} ({})", fault.name(), victim, target.broker_name(victim));
-        let t0 = Instant::now();
+        let issued = Instant::now();
         target.fault(victim, fault).await?;
+        let t0 = Instant::now();
+        notes.push(format!("fault command took {} ms; t0 is after it", (t0 - issued).as_millis()));
 
         // (a) leadership moves, as any live broker reports it.
         let mut leader_moved_ms = None;

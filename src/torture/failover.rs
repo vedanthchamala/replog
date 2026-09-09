@@ -117,6 +117,8 @@ pub struct AckClock {
     epoch: Instant,
     last_ack_ns: Vec<AtomicU64>,
     acked: Vec<AtomicU64>,
+    /// Largest interval between consecutive acks since the last `reset_gap`.
+    gap_max_ns: Vec<AtomicU64>,
 }
 
 impl AckClock {
@@ -125,14 +127,40 @@ impl AckClock {
             epoch,
             last_ack_ns: (0..partitions).map(|_| AtomicU64::new(0)).collect(),
             acked: (0..partitions).map(|_| AtomicU64::new(0)).collect(),
+            gap_max_ns: (0..partitions).map(|_| AtomicU64::new(0)).collect(),
         }
     }
 
     pub fn record(&self, partition: u32, n: usize) {
-        let ns = self.epoch.elapsed().as_nanos() as u64;
+        let p = partition as usize;
+        let ns = (self.epoch.elapsed().as_nanos() as u64).max(1);
         // 0 means "never"; a real stamp is always > 0 after epoch.
-        self.last_ack_ns[partition as usize].store(ns.max(1), Ordering::Relaxed);
-        self.acked[partition as usize].fetch_add(n as u64, Ordering::Relaxed);
+        let prev = self.last_ack_ns[p].swap(ns, Ordering::Relaxed);
+        if prev > 0 {
+            let gap = ns.saturating_sub(prev);
+            self.gap_max_ns[p].fetch_max(gap, Ordering::Relaxed);
+        }
+        self.acked[p].fetch_add(n as u64, Ordering::Relaxed);
+    }
+
+    /// Start a fresh gap measurement (call right before a fault).
+    pub fn reset_gap(&self, partition: u32) {
+        self.gap_max_ns[partition as usize].store(0, Ordering::Relaxed);
+    }
+
+    /// Largest ack-to-ack interval since the reset, including a gap that is
+    /// still open right now (no ack since `last_ack`). This is the client's
+    /// unavailability window, immune to a straggling in-flight ack landing
+    /// just after the fault.
+    pub fn max_gap(&self, partition: u32) -> Option<Duration> {
+        let p = partition as usize;
+        let recorded = self.gap_max_ns[p].load(Ordering::Relaxed);
+        let open = match self.last_ack_ns[p].load(Ordering::Relaxed) {
+            0 => 0,
+            last => (self.epoch.elapsed().as_nanos() as u64).saturating_sub(last),
+        };
+        let g = recorded.max(open);
+        (g > 0).then(|| Duration::from_nanos(g))
     }
 
     pub fn last_ack(&self, partition: u32) -> Option<Instant> {
@@ -171,7 +199,11 @@ impl AckClock {
 pub struct FaultOutcome {
     pub fault: &'static str,
     pub victim: usize,
+    /// Seconds into the run when the fault became effective (the docker
+    /// command returned).
     pub t0_secs: f64,
+    /// How long the fault command itself took; t0 is stamped after it.
+    pub cli_ms: u64,
     pub heal_after_ms: u64,
     pub partition: u32,
     /// "leader" or "follower" — the victim's role for this partition at t0.
@@ -179,25 +211,30 @@ pub struct FaultOutcome {
     pub leader_moved_ms: Option<u64>,
     pub new_leader: i32,
     pub first_ack_ms: Option<u64>,
+    /// Largest interval without acks inside the fault window (fault → acks
+    /// resumed after heal, or budget). The client-visible outage.
+    pub max_gap_ms: Option<u64>,
 }
 
 pub fn outcomes_csv_header() -> &'static str {
-    "fault,victim,t0_s,heal_after_ms,partition,role,leader_moved_ms,new_leader,first_ack_ms"
+    "fault,victim,t0_s,cli_ms,heal_after_ms,partition,role,leader_moved_ms,new_leader,first_ack_ms,max_gap_ms"
 }
 
 pub fn outcome_csv_row(o: &FaultOutcome) -> String {
     let opt = |v: Option<u64>| v.map(|x| x.to_string()).unwrap_or_default();
     format!(
-        "{},{},{:.3},{},{},{},{},{},{}",
+        "{},{},{:.3},{},{},{},{},{},{},{},{}",
         o.fault,
         o.victim,
         o.t0_secs,
+        o.cli_ms,
         o.heal_after_ms,
         o.partition,
         o.role,
         opt(o.leader_moved_ms),
         o.new_leader,
-        opt(o.first_ack_ms)
+        opt(o.first_ack_ms),
+        opt(o.max_gap_ms)
     )
 }
 

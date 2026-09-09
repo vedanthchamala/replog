@@ -78,13 +78,14 @@ for t in targets:
                 if key not in seen:
                     seen.add(key)
                     agg["faults"] += 1
+                gap = r.get("max_gap_ms") or ""
                 if r["role"] == "leader":
                     if r["leader_moved_ms"]:
                         agg["moved"][r["fault"]].append(int(r["leader_moved_ms"]))
-                    if r["first_ack_ms"]:
-                        agg["ack_leader"][r["fault"]].append(int(r["first_ack_ms"]))
-                elif r["first_ack_ms"]:
-                    agg["ack_follower"][r["fault"]].append(int(r["first_ack_ms"]))
+                    if gap:
+                        agg["ack_leader"][r["fault"]].append(int(gap))
+                elif gap:
+                    agg["ack_follower"][r["fault"]].append(int(gap))
     for ctl in ("control-acks1", "control-acksall", "baseline"):
         d = ROOT / t / ctl
         if d.exists():
@@ -99,18 +100,18 @@ for t, a in per_target.items():
     lines.append(f"| {t} | {len(a['seeds'])} | {a['faults']} | {s['acked']} | {s['violations']} "
                  f"| {s['extra_dups']} | {s['zero_secs']} / {s['load_secs']} |")
 lines.append("")
-lines.append("Leader faults — p50 / p90 / max in ms (metadata-visible leader change; first ack after fault):")
+lines.append("Leader faults — p50 / p90 / max in ms (metadata-visible leader change; largest ack gap in the fault window):")
 lines.append("")
-lines.append("| target | fault | leader moved | first ack |")
+lines.append("| target | fault | leader moved | largest ack gap |")
 lines.append("|---|---|---|---|")
 for t, a in per_target.items():
     for f in FAULTS:
         if a["moved"][f] or a["ack_leader"][f]:
             lines.append(f"| {t} | {f} | {fmt_p(a['moved'][f])} | {fmt_p(a['ack_leader'][f])} |")
 lines.append("")
-lines.append("Follower faults — first ack after fault (the stall a follower's death costs a leader):")
+lines.append("Follower faults — largest ack gap in the fault window (the stall a follower's death costs the leader):")
 lines.append("")
-lines.append("| target | fault | first ack |")
+lines.append("| target | fault | largest ack gap |")
 lines.append("|---|---|---|")
 for t, a in per_target.items():
     for f in FAULTS:
@@ -144,11 +145,11 @@ for col, f in enumerate(FAULTS):
     ax = axes[0][col]
     for t, a in per_target.items():
         ecdf(ax, [x / 1000 for x in a["moved"][f]], f"{t} leader moved", COLORS.get(t, "#777"))
-        ecdf(ax, [x / 1000 for x in a["ack_leader"][f]], f"{t} first ack", COLORS.get(t, "#777"))
+        ecdf(ax, [x / 1000 for x in a["ack_leader"][f]], f"{t} largest ack gap", COLORS.get(t, "#777"))
         # dash the first-ack line
         if ax.lines:
             ax.lines[-1].set_linestyle("--")
-    ax.set_title(f"leader {f}: time to new leader (solid) and to first ack (dashed)")
+    ax.set_title(f"leader {f}: time to new leader (solid), largest ack gap (dashed)")
     ax.set_xlabel("seconds after fault")
     ax.set_ylabel("fraction of leader faults")
     ax.grid(alpha=0.3)
@@ -157,8 +158,8 @@ for col, f in enumerate(FAULTS):
 ax = axes[1][0]
 for t, a in per_target.items():
     allf = [x / 1000 for f in FAULTS for x in a["ack_follower"][f]]
-    ecdf(ax, allf, f"{t} follower fault → first ack", COLORS.get(t, "#777"))
-ax.set_title("follower faults: stall until the next ack (all fault kinds)")
+    ecdf(ax, allf, f"{t} follower fault → largest ack gap", COLORS.get(t, "#777"))
+ax.set_title("follower faults: largest ack gap (all fault kinds)")
 ax.set_xlabel("seconds after fault")
 ax.set_ylabel("fraction of follower faults")
 ax.grid(alpha=0.3)

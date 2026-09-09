@@ -1,0 +1,10 @@
+checker: 31725 acked, 63450 consumed (31725 distinct), 31725 duplicate deliveries
+  at-least-once: OK
+
+fault    role      n   leader moved (min/p50/p90/max ms)   largest ack gap in fault window (min/p50/p90/max ms)
+isolate  follower  4   -                                    41/44/44/44 (n=4)
+isolate  leader    4   3872/4910/5876/5876 (n=4)            4418/5144/6214/6214 (n=4)
+kill     follower  6   -                                    39/41/41/41 (n=6)
+pause    follower  2   -                                    42/42/42/42 (n=2)
+availability: 7 of 121 load-seconds had zero acks; 31725 ids acked in total
+duplicates: 0 deliveries beyond one per reader per id (2 readers per partition; raw checker count 31725 includes the extra readers)

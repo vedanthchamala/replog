@@ -362,3 +362,84 @@ at the process boundary, and under seeded random schedules — verified by an
 offline checker from client-observed histories in every form. Stage 6
 (idempotent producer / compaction / sendfile / GCP deployment) remains the
 documented stretch tier.
+
+## 2026-09-08 — Stage 6: the harness becomes a cross-system tool, and it finds a real bug in our own log
+
+**Why.** Every Stage 5 verdict was about replog with no reference point: the
+fault backend was `kill -9` on child processes plus a proxy on the controller
+link, the workload spoke replog's protocol, and data-path partitions were not
+modeled. Stage 6 makes the harness target-agnostic — a Docker fault backend
+(`kill`/`pause`/`isolate`), a `FaultTarget` + `Workload` trait pair, an rdkafka
+adapter — and runs replog and Redpanda under identical seeded schedules, in
+identical containers, at a matched 1000 ms detection timeout.
+
+**Built.** `src/torture/` (docker backend; kafka target via rdkafka + a
+hand-rolled Kafka Metadata v4 client; replog target via ClusterClient; probe;
+generic seeded schedule with failover decomposition, per-second ack timeline,
+and a per-fault "largest ack gap" metric), the `replog_faults` binary
+(`probe`/`run`/`verify`), `deploy/{redpanda,replog,kafka}` composes with a
+shared peers network plus one private edge network per broker, replog brokers
+advertising separate client and inter-broker addresses (controller snapshot
+bumped to "RLC2"), `bench/run_faults.sh`, `bench/plot_faults.py`,
+`bench/plot_recovery.py`.
+
+**Checkpoint discipline (the point).** Nothing was reported until three gates
+passed in order: a `probe` proving each fault does what it claims on the target;
+a no-fault baseline coming back checker-clean; and a sensitivity control proving
+the checker *can* fail — same isolate-only seed at `acks=1` (Redpanda loses
+1,185 acked ids, replog 5,875) vs `acks=all` (zero on both). Only then the
+contract seeds.
+
+**Result — contract holds on both, availability differs, and the difference is
+ISR-vs-Raft made measurable.** 3×120 s seeds, kill/pause/isolate, acks=all: zero
+contract violations on either system. Then:
+- A single *follower* death stalls replog's acks=all for ~1.7 s (HWM gated on the
+  silent follower until the 1.5 s replica-lag window shrinks it out); Redpanda,
+  committing on a majority, barely notices (~50 ms).
+- replog detects and re-elects *faster* than Redpanda (leadership moves in <1 s
+  vs 3.4–6.6 s of Raft pre-vote/vote), but recovers acks=all *slower*.
+
+**War story / finding — the failover that waits for the corpse.** replog's
+acks=all recovery after a leader `kill` scales with how long the broker stays
+down: heal 4 s → ~7 s gap, heal 12 s → ~15 s gap, i.e. downtime + ~3 s. Redpanda
+is flat at ~4–6 s regardless. Decomposed it with env-gated HWM + client traces on
+one clean run:
+- The client *does* re-route to the new leader in <1 s (leader_for flips to the
+  new broker at the new epoch).
+- The new leader is healthy — 2-node ISR {survivors}, HWM caught up — but its log
+  is frozen: it receives no writes for the whole downtime.
+- The HWM trace shows the ISR flapping `[0,2] → [0,1,2] → [0,2]`: the *dead* old
+  leader keeps being re-admitted to the ISR, and the new leader's HWM then gates
+  on its frozen match offset while fresh writes pile up in `pending_all`
+  un-acked. Root cause is the Stage-4 caught-up-recency rule (`isr_maintenance`):
+  a replica that never fetched from this leader defaults its "last caught up" to
+  `leader_since`, so for the grace window it counts as in-sync — and that grace
+  wrongly includes a broker that is dead, not merely new.
+- Durability was never at risk: the checker reports zero acked loss throughout.
+  This is an availability defect, and it is the top item for the next stage:
+  a newly-elected leader must not extend the in-sync grace to a replica the
+  controller already declared down.
+
+**Findings about the target, not the tool.** (1) Redpanda's `--mode
+dev-container` bundles `--unsafe-bypass-fsync` and `write_caching_default:true`,
+and the image's `redpanda.yaml` ships `developer_mode:true` (which makes `rpk`
+add the fsync bypass on its own) — a compose copied from a tutorial runs with
+fsync off; the deploy sets `developer_mode=false` and pins write caching off, and
+the container's "Running:" line proves the bypass flag is gone. (2) Redpanda's
+crash-loop guard stops a node after 5 unclean exits — correct for production,
+fatal for a SIGKILL harness; `crash_loop_limit` raised and `deploy/heal.sh`
+clears the marker. (3) A leader poller built on librdkafka asked whichever broker
+it was connected to — often the zombie itself during an isolate — and reported
+"leadership never moved"; replaced by asking every broker over a plain socket and
+taking the strict majority.
+
+**Also fixed on the way:** t0 is now stamped *after* the fault command returns
+(a straggling in-flight ack was masking the true gap); health after a heal
+requires every broker to answer its own metadata (the admin API reported the
+pre-fault picture for ~0.5 s after a quick restart); a health timeout no longer
+discards the run (fault injection stops, the history is kept, the checker still
+judges it); a fresh topic per run (reuse let readers see a prior run's ids); and
+`rng.range` no longer panics on min==max gap/heal bounds.
+
+43 tests green (the two-advertised-address change touched proto/controller/broker
+and left every Stage 2–5 test passing).

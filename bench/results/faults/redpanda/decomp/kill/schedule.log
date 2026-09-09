@@ -1,0 +1,8 @@
+[t=   9.47s] FAULT kill broker 1 (rp-1) [p0:follower p1:leader], heal in 12090 ms
+[t=  22.30s] HEAL kill broker 1; waiting for full health
+[t=  34.49s] HEALTHY after 12219 ms
+[t=  44.25s] FAULT kill broker 2 (rp-2) [p0:leader p1:leader], heal in 11545 ms
+[t=  56.35s] HEAL kill broker 2; waiting for full health
+[t=  74.57s] HEALTHY after 18244 ms
+[t=  74.57s] schedule done; waiting for full health
+[t=  75.09s] producers stopped; readers draining

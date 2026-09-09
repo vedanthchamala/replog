@@ -74,12 +74,12 @@ impl RunSummary {
             if let Some(m) = o.leader_moved_ms {
                 g.0.push(m);
             }
-            if let Some(a) = o.first_ack_ms {
+            if let Some(a) = o.max_gap_ms {
                 g.1.push(a);
             }
             g.2 += 1;
         }
-        s.push_str("fault    role      n   leader moved (min/p50/p90/max ms)   first ack after fault (min/p50/p90/max ms)\n");
+        s.push_str("fault    role      n   leader moved (min/p50/p90/max ms)   largest ack gap in fault window (min/p50/p90/max ms)\n");
         for ((fault, role), (moved, acks, n)) in groups {
             let fmt = |p: Option<(u64, u64, u64, u64, usize)>| match p {
                 Some((mn, p50, p90, mx, k)) => format!("{mn}/{p50}/{p90}/{mx} (n={k})"),
@@ -248,13 +248,23 @@ pub async fn run<T: FaultTarget + 'static, W: Workload>(
         tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
     }
     while Instant::now() < deadline && !cfg.faults.is_empty() {
-        let gap = rng.range(cfg.min_gap_ms, cfg.max_gap_ms);
+        // Tolerate min == max (a fixed cadence, useful for decomposition runs);
+        // rng.range requires lo < hi.
+        let gap = if cfg.min_gap_ms >= cfg.max_gap_ms {
+            cfg.min_gap_ms
+        } else {
+            rng.range(cfg.min_gap_ms, cfg.max_gap_ms)
+        };
         tokio::time::sleep(Duration::from_millis(gap)).await;
         if Instant::now() >= deadline {
             break;
         }
         let victim = rng.range(0, n as u64) as usize;
-        let heal_ms = rng.range(cfg.min_heal_ms, cfg.max_heal_ms);
+        let heal_ms = if cfg.min_heal_ms >= cfg.max_heal_ms {
+            cfg.min_heal_ms
+        } else {
+            rng.range(cfg.min_heal_ms, cfg.max_heal_ms)
+        };
         let fault = *rng.pick(&cfg.faults);
         let leaders = watch.current();
         let roles: Vec<&'static str> = leaders
@@ -276,8 +286,15 @@ pub async fn run<T: FaultTarget + 'static, W: Workload>(
                     .join(" ")
             ),
         );
-        let t0 = Instant::now();
+        for p in 0..partitions {
+            clock.reset_gap(p);
+        }
+        let issued = Instant::now();
         target.fault(victim, fault).await?;
+        // The fault is effective once the docker command has returned; acks
+        // that landed while the CLI was running are not post-fault acks.
+        let t0 = Instant::now();
+        let cli_ms = (t0 - issued).as_millis() as u64;
         let t0_secs = (t0 - started).as_secs_f64();
 
         let observe = async {
@@ -298,6 +315,16 @@ pub async fn run<T: FaultTarget + 'static, W: Workload>(
         };
         let (first_acks, (heal_result, healed_at)) = tokio::join!(observe, heal);
         heal_result?;
+        // The fault window closes when acks have resumed after the heal on
+        // every partition (or the budget runs out); only then is the largest
+        // gap inside it known.
+        let resume_deadline = healed_at + observe_budget;
+        for p in 0..partitions {
+            clock.first_ack_after(p, healed_at, resume_deadline).await;
+        }
+        let max_gaps: Vec<Option<u64>> = (0..partitions)
+            .map(|p| clock.max_gap(p).map(|g| g.as_millis() as u64))
+            .collect();
         log_event(
             &mut schedule,
             format!("HEAL {} broker {victim}; waiting for full health", fault.name()),
@@ -326,12 +353,14 @@ pub async fn run<T: FaultTarget + 'static, W: Workload>(
                 fault: fault.name(),
                 victim,
                 t0_secs,
+                cli_ms,
                 heal_after_ms: heal_ms,
                 partition: p,
                 role: roles[p as usize],
                 leader_moved_ms: moved.as_ref().map(|c| (c.at - t0).as_millis() as u64),
                 new_leader: moved.as_ref().map(|c| c.new).unwrap_or(-1),
                 first_ack_ms: first_acks[p as usize].map(|t| (t - t0).as_millis() as u64),
+                max_gap_ms: max_gaps[p as usize],
             });
         }
         if cut_short {

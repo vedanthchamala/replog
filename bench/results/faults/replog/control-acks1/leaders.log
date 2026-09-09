@@ -1,0 +1,7 @@
+[t=  0.005s] p0 leader -1 -> 0
+[t=  0.005s] p1 leader -1 -> 1
+[t=  3.377s] p0 leader 0 -> 1
+[t= 30.701s] p0 leader 1 -> 0
+[t= 30.701s] p1 leader 1 -> 0
+[t= 59.879s] p0 leader 0 -> 1
+[t= 59.879s] p1 leader 0 -> 1

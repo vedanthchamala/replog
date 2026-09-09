@@ -1,0 +1,15 @@
+fault,victim,t0_s,cli_ms,heal_after_ms,partition,role,leader_moved_ms,new_leader,first_ack_ms,max_gap_ms
+isolate,0,2.393,104,5346,0,leader,1018,1,6506,6607
+isolate,0,2.393,104,5346,1,follower,,-1,6488,1581
+isolate,0,11.867,70,4798,0,follower,,-1,1615,1679
+isolate,0,11.867,70,4798,1,follower,,-1,1616,1680
+isolate,2,20.793,109,5083,0,follower,,-1,1688,1780
+isolate,2,20.793,109,5083,1,follower,,-1,1690,1783
+isolate,1,30.190,88,5190,0,leader,1176,0,6554,6643
+isolate,1,30.190,88,5190,1,leader,1176,0,6554,6643
+isolate,2,39.403,108,3797,0,follower,,-1,1568,1650
+isolate,2,39.403,108,3797,1,follower,,-1,1569,1651
+isolate,2,49.318,99,5813,0,follower,,-1,1552,1634
+isolate,2,49.318,99,5813,1,follower,,-1,1553,1635
+isolate,0,59.822,108,3906,0,leader,1143,1,6553,6653
+isolate,0,59.822,108,3906,1,leader,1143,1,6553,6653

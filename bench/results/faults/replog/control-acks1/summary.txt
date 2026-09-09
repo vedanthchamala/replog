@@ -1,0 +1,8 @@
+checker: 24085 acked, 36420 consumed (18210 distinct), 18210 duplicate deliveries
+  at-least-once: VIOLATED — 5875 acked ids never consumed (first few: [810, 811, 812, 813, 814, 825, 826, 827, 828, 829])
+
+fault    role      n   leader moved (min/p50/p90/max ms)   largest ack gap in fault window (min/p50/p90/max ms)
+isolate  follower  9   -                                    29/32/34/34 (n=9)
+isolate  leader    5   979/981/1063/1063 (n=5)              33/35/36/36 (n=5)
+availability: 0 of 66 load-seconds had zero acks; 24085 ids acked in total
+duplicates: 0 deliveries beyond one per reader per id (2 readers per partition; raw checker count 18210 includes the extra readers)

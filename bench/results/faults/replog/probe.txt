@@ -1,0 +1,11 @@
+fault    victim  leader moved   new  victim port          zombie claim  healed    verdict   (detect timeout 1000 ms, budget 15000 ms)
+kill     1          795 ms      0    refused                  -            609 ms PASS
+         note: fault command took 235 ms; t0 is after it
+         note: views at move: b0=0 b1=? b2=0
+pause    0         1548 ms      1    connects, no answer      -            540 ms PASS
+         note: fault command took 45 ms; t0 is after it
+         note: views at move: b0=? b1=1 b2=1
+isolate  1         1009 ms      0    serving (leader=1)       -          11174 ms PASS
+         note: fault command took 91 ms; t0 is after it
+         note: views at move: b0=0 b1=1 b2=0
+         note: victim still claims leadership 16069 ms after isolate (budget exhausted)
